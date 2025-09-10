@@ -2,64 +2,57 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Overlay Camera</title>
+  <title>Golf Swing Composite (Base + Permanent Overlays)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root { --edge: 80vw; }
+    :root { --box-width: min(80vw, 1000px); }
     body { margin:0; background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
     #status {
-      position: absolute; top: 12px; left: 12px;
-      background: rgba(255,255,255,0.08); padding: 6px 10px; border-radius: 8px;
-      font-size: 14px;
+      position:absolute; top:12px; left:12px;
+      background:rgba(255,255,255,0.1); padding:6px 10px; border-radius:8px; font-size:14px;
     }
-    #feedWrap {
-      position: absolute; inset: 0; display: grid; place-items: center;
-    }
+    #feedWrap { position:absolute; inset:0; display:grid; place-items:center; }
     #feedCanvas {
-      width: min(80vw, 1000px);
+      width: var(--box-width);
       aspect-ratio: 4 / 3;
-      border: 2px solid #fff; background:#000;
-      display: block;
+      border: 2px solid #fff; background:#000; display:block;
     }
-    #videoEl { display:none; } /* video element is hidden; we draw into canvas */
     #controls {
-      position: absolute; left: 0; right: 0; bottom: 18px;
-      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      position:absolute; left:0; right:0; bottom:18px;
+      display:flex; flex-direction:column; align-items:center; gap:10px;
     }
-    .row { display:flex; gap: 18px; flex-wrap: wrap; justify-content:center; }
-    button { cursor: pointer; font-size: 16px; }
+    .row { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
+    button { cursor:pointer; font-size:16px; }
     #baseBtn {
-      width: 86px; height: 86px; border-radius: 50%;
-      background: #fff; color:#000; border: 2px solid #000;
-      font-weight: 600;
+      width:86px; height:86px; border-radius:50%;
+      background:#fff; color:#000; border:2px solid #000; font-weight:600;
     }
     #startBtn {
-      width: 110px; height: 110px; border-radius: 50%;
-      background: #e10000; color: #fff; border: 4px solid #fff;
-      font-weight: 700;
+      width:110px; height:110px; border-radius:50%;
+      background:#e10000; color:#fff; border:4px solid #fff; font-weight:700;
     }
-    #startBtn[disabled], #baseBtn[disabled] { opacity: 0.45; cursor: default; }
+    #startBtn[disabled], #baseBtn[disabled] { opacity:.45; cursor:default; }
+    label { font-size:14px; color:#ddd; display:flex; align-items:center; gap:8px; }
     select {
       appearance:none; -webkit-appearance:none; -moz-appearance:none;
       background:#111; color:#fff; border:1px solid #555; border-radius:8px;
-      padding: 8px 10px; font-size: 14px; min-width: 130px;
+      padding:8px 10px; font-size:14px; min-width:130px;
     }
-    label { font-size: 14px; color:#ddd; display:flex; align-items:center; gap:8px; }
+    /* Hidden <video> (we draw it onto canvases instead) */
+    #videoEl { display:none; }
   </style>
 </head>
 <body>
-  <!-- Hidden live video source -->
+  <!-- Hidden live video -->
   <video id="videoEl" autoplay playsinline muted></video>
 
-  <!-- Centered canvas that shows live preview (before base), then the base, then permanent overlays -->
+  <!-- Centered canvas: shows live preview (pre-base), then base, then permanent overlays -->
   <div id="feedWrap">
     <canvas id="feedCanvas"></canvas>
   </div>
 
-  <!-- Status -->
   <div id="status">Loading…</div>
 
-  <!-- Controls -->
   <div id="controls">
     <div class="row">
       <button id="baseBtn">Base</button>
@@ -100,133 +93,126 @@
 
   <script>
     // Elements
-    const videoEl = document.getElementById('videoEl');
-    const feedCanvas = document.getElementById('feedCanvas');
-    const statusEl = document.getElementById('status');
-    const baseBtn = document.getElementById('baseBtn');
-    const startBtn = document.getElementById('startBtn');
-    const resSel = document.getElementById('resolution');
-    const intSel = document.getElementById('interval');
-    const alphaSel = document.getElementById('overlayAlpha');
+    const videoEl   = document.getElementById('videoEl');
+    const feedCanvas= document.getElementById('feedCanvas');
+    const statusEl  = document.getElementById('status');
+    const baseBtn   = document.getElementById('baseBtn');
+    const startBtn  = document.getElementById('startBtn');
+    const resSel    = document.getElementById('resolution');
+    const intSel    = document.getElementById('interval');
+    const alphaSel  = document.getElementById('overlayAlpha');
 
-    // Scratch for grabbing frames safely
-    const scratch = document.createElement('canvas');
-    const sctx = scratch.getContext('2d', { willReadFrequently: false });
+    // Offscreen canvases (consistent with composite size)
+    const scratch   = document.createElement('canvas'); // scaled current frame
+    const maskCanvas= document.createElement('canvas'); // motion-only image
+    const sctx      = scratch.getContext('2d', { willReadFrequently: true });
+    const mctx      = maskCanvas.getContext('2d', { willReadFrequently: true });
 
     // State
-    let haveBase = false;        // true once base snapshot locked
-    let previewRAF = null;       // requestAnimationFrame id for live preview
-    let recordTimer = null;      // setInterval id for overlay capture
-    let recording = false;       // is capturing overlays
-    let stream = null;           // media stream
+    let haveBase = false;         // base locked?
+    let previewRAF = null;        // rAF id for preview loop
+    let recording = false;        // capturing overlays?
+    let recordTimer = null;       // interval id
+    let stream = null;            // media stream
+    let baseImageData = null;     // base pixels (at composite size) for motion diff
 
-    // --- Camera setup (prefer rear camera; fallback gracefully) ---
-    (async function initCamera() {
+    // ---- Camera: prefer rear, fallback gracefully ----
+    (async function initCamera(){
       statusEl.textContent = 'Requesting camera…';
-      const attempts = [
-        { video: { facingMode: { exact: 'environment' } }, audio: false },
-        { video: { facingMode: { ideal: 'environment' } }, audio: false },
-        { video: { facingMode: { ideal: 'user' } }, audio: false },
-        { video: true, audio: false }
+      const tries = [
+        { video: { facingMode: { exact: 'environment' } }, audio:false },
+        { video: { facingMode: { ideal: 'environment' } }, audio:false },
+        { video: { facingMode: { ideal: 'user' } }, audio:false },
+        { video: true, audio:false }
       ];
-
       let lastErr;
-      for (const c of attempts) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(c);
-          break;
-        } catch (e) { lastErr = e; }
+      for (const c of tries) {
+        try { stream = await navigator.mediaDevices.getUserMedia(c); break; }
+        catch(e){ lastErr = e; }
       }
-
-      if (!stream) {
-        statusEl.textContent = 'Camera blocked/unavailable';
-        return;
-      }
-
+      if (!stream) { statusEl.textContent = 'Camera blocked/unavailable'; return; }
       videoEl.srcObject = stream;
       try { await videoEl.play(); } catch {}
-      statusEl.textContent = 'Camera ready — take Base when framed';
-
-      // Kick off live preview into the canvas until Base is taken
-      startPreviewLoop();
+      statusEl.textContent = 'Camera ready — frame your scene and press Base';
+      startPreviewLoop(); // show live preview until base captured
     })();
 
-    function startPreviewLoop() {
+    // ---- Live preview loop (stops as soon as Base is taken) ----
+    function startPreviewLoop(){
       cancelAnimationFrame(previewRAF);
       const ctx = feedCanvas.getContext('2d');
 
       const tick = () => {
-        if (haveBase) return; // stop drawing once base is taken
-        const vw = videoEl.videoWidth || 0;
-        const vh = videoEl.videoHeight || 0;
+        if (haveBase) return; // stop preview immediately after base
+        const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
         if (vw && vh) {
-          // Set canvas pixel size to chosen resolution (keeps sharp output)
-          const targetMax = parseInt(resSel.value, 10);
-          const scale = targetMax / Math.max(vw, vh);
-          const cw = Math.max(1, Math.round(vw * scale));
-          const ch = Math.max(1, Math.round(vh * scale));
+          const targetMax = parseInt(resSel.value,10);
+          const scale = targetMax / Math.max(vw,vh);
+          const cw = Math.max(1, Math.round(vw*scale));
+          const ch = Math.max(1, Math.round(vh*scale));
+
+          // Only resize canvases if dimensions changed (resizing clears!)
           if (feedCanvas.width !== cw || feedCanvas.height !== ch) {
             feedCanvas.width = cw; feedCanvas.height = ch;
+            scratch.width = cw; scratch.height = ch;
+            maskCanvas.width = cw; maskCanvas.height = ch;
           }
-          // Draw current video frame to canvas (preview only)
+
           ctx.globalAlpha = 1.0;
           ctx.globalCompositeOperation = 'source-over';
-          ctx.drawImage(videoEl, 0, 0, feedCanvas.width, feedCanvas.height);
+          ctx.drawImage(videoEl, 0, 0, cw, ch);
         }
         previewRAF = requestAnimationFrame(tick);
       };
       previewRAF = requestAnimationFrame(tick);
     }
 
-    function grabFrameToScratch() {
-      const vw = videoEl.videoWidth || 0;
-      const vh = videoEl.videoHeight || 0;
-      if (!vw || !vh) return false;
-      // Match scratch to video pixels
-      if (scratch.width !== vw || scratch.height !== vh) {
-        scratch.width = vw; scratch.height = vh;
-      }
+    // Draw current video frame (scaled) into scratch (composite size)
+    function drawVideoIntoScratch(){
+      const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
+      if (!vw || !vh || scratch.width===0 || scratch.height===0) return false;
       sctx.globalAlpha = 1.0;
       sctx.globalCompositeOperation = 'source-over';
-      sctx.drawImage(videoEl, 0, 0, vw, vh);
+      sctx.drawImage(videoEl, 0, 0, scratch.width, scratch.height);
       return true;
     }
 
-    function drawScaled(srcCanvas, destCtx, dw, dh, alpha) {
-      if (!srcCanvas || !destCtx) return;
-      destCtx.globalAlpha = alpha;
-      destCtx.globalCompositeOperation = 'source-over';
-      destCtx.drawImage(srcCanvas, 0, 0, srcCanvas.width, srcCanvas.height, 0, 0, dw, dh);
-    }
-
-    // --- Base capture: draw once at 100% and stop preview loop ---
+    // ---- Base capture (solid 100%) ----
     baseBtn.addEventListener('click', () => {
       if (haveBase) return;
-      if (!grabFrameToScratch()) { statusEl.textContent = 'No frame yet — try again'; return; }
 
-      // Fix canvas pixel size to chosen resolution based on the *current* frame dimensions
-      const vw = scratch.width, vh = scratch.height;
-      const targetMax = parseInt(resSel.value, 10);
-      const scale = targetMax / Math.max(vw, vh);
-      const cw = Math.max(1, Math.round(vw * scale));
-      const ch = Math.max(1, Math.round(vh * scale));
-      feedCanvas.width = cw; feedCanvas.height = ch;
+      // Ensure canvases sized to chosen resolution *before* snapshot
+      const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
+      if (!vw || !vh) { statusEl.textContent='No frame yet — try again'; return; }
+      const targetMax = parseInt(resSel.value,10);
+      const scale = targetMax / Math.max(vw,vh);
+      const cw = Math.max(1, Math.round(vw*scale));
+      const ch = Math.max(1, Math.round(vh*scale));
 
-      const ctx = feedCanvas.getContext('2d');
-      ctx.clearRect(0, 0, cw, ch);
-      drawScaled(scratch, ctx, cw, ch, 1.0); // base = solid
+      if (feedCanvas.width !== cw || feedCanvas.height !== ch) {
+        feedCanvas.width = cw; feedCanvas.height = ch;
+        scratch.width = cw; scratch.height = ch;
+        maskCanvas.width = cw; maskCanvas.height = ch;
+      }
+
+      // Grab and stamp base
+      if (!drawVideoIntoScratch()) { statusEl.textContent='No frame yet — try again'; return; }
+      const cctx = feedCanvas.getContext('2d');
+      cctx.clearRect(0,0,feedCanvas.width,feedCanvas.height);
+      cctx.globalAlpha = 1.0;                       // base fully solid
+      cctx.globalCompositeOperation = 'source-over'; // normal paint
+      cctx.drawImage(scratch, 0, 0);                // draw base once
+      baseImageData = cctx.getImageData(0,0,feedCanvas.width,feedCanvas.height); // store base for motion mask
 
       haveBase = true;
       baseBtn.disabled = true;
       startBtn.disabled = false;
-      statusEl.textContent = 'Base locked — press Start to overlay';
-
-      // Stop preview to ensure nothing ever redraws over the base
-      cancelAnimationFrame(previewRAF);
-      previewRAF = null;
+      statusEl.textContent = 'Base locked — press Start to record';
+      // stop preview so nothing overwrites base
+      cancelAnimationFrame(previewRAF); previewRAF=null;
     });
 
-    // --- Start/Stop overlay capture: additive stamping (no clears, no base redraw) ---
+    // ---- Start/Stop toggle: additive stamping of motion-only regions ----
     startBtn.addEventListener('click', () => {
       if (!haveBase) return;
 
@@ -235,24 +221,60 @@
         recording = true;
         startBtn.textContent = 'Stop';
         startBtn.style.background = '#b00000';
-        const ctx = feedCanvas.getContext('2d');
-        const alpha = parseFloat(alphaSel.value || '0.75');
-        const intervalMs = Math.max(10, parseInt(intSel.value || '200', 10));
 
-        // Safety: ensure composite mode and do NOT clear or redraw base
-        ctx.globalCompositeOperation = 'source-over';
+        const overlayAlpha = Math.max(0, Math.min(1, parseFloat(alphaSel.value || '0.75')));
+        const intervalMs   = Math.max(10, parseInt(intSel.value || '200', 10));
+        const cctx = feedCanvas.getContext('2d');
+
+        // Prefer additive blend to keep earlier overlays equally visible
+        let blendMode = 'lighter'; // widely supported additive mode
+        try { cctx.globalCompositeOperation = 'plus-lighter'; blendMode = 'plus-lighter'; }
+        catch(_) { cctx.globalCompositeOperation = 'lighter'; }
+
+        // Pre-grab base data array for fast diff
+        const baseData = baseImageData.data; // Uint8ClampedArray
+        const W = feedCanvas.width, H = feedCanvas.height;
+        const THRESH = 40; // motion sensitivity (0-765). Raise if noise.
+        const maskedImage = mctx.createImageData(W,H);
+        const md = maskedImage.data;
 
         recordTimer = setInterval(() => {
-          // Grab the current video frame into the scratch canvas
-          if (!grabFrameToScratch()) return;
+          // Draw current frame to scratch (scaled to composite size)
+          if (!drawVideoIntoScratch()) return;
 
-          // Stamp permanently into the main canvas at chosen opacity
-          drawScaled(scratch, ctx, feedCanvas.width, feedCanvas.height, alpha);
-          // NOTE: we NEVER call clearRect or redraw base here.
-          // Each call simply adds the new frame to what’s already there.
+          // Get current frame pixels
+          const curr = sctx.getImageData(0,0,W,H);
+          const cd = curr.data;
+
+          // Build motion-only mask vs base (skip background so it never overpaints)
+          // Simple per-pixel abs diff on RGB; write only moving pixels; keep their color.
+          for (let i=0; i<cd.length; i+=4) {
+            const dr = cd[i]   - baseData[i];
+            const dg = cd[i+1] - baseData[i+1];
+            const db = cd[i+2] - baseData[i+2];
+            const ad = (dr<0?-dr:dr) + (dg<0?-dg:dg) + (db<0?-db:db); // 0..765
+            if (ad > THRESH) {
+              md[i]   = cd[i];
+              md[i+1] = cd[i+1];
+              md[i+2] = cd[i+2];
+              md[i+3] = 255; // opaque in mask; we'll control alpha on draw
+            } else {
+              md[i]   = 0;
+              md[i+1] = 0;
+              md[i+2] = 0;
+              md[i+3] = 0;   // fully transparent
+            }
+          }
+
+          // Paint masked frame onto maskCanvas, then additively blend onto composite
+          mctx.putImageData(maskedImage, 0, 0);
+          cctx.globalCompositeOperation = blendMode; // additive
+          cctx.globalAlpha = overlayAlpha;           // user-chosen opacity
+          cctx.drawImage(maskCanvas, 0, 0);
+          cctx.globalCompositeOperation = 'source-over'; // restore for safety
+
+          statusEl.textContent = `Recording @ ${(intervalMs/1000).toFixed(2)}s — overlays stay`;
         }, intervalMs);
-
-        statusEl.textContent = `Recording @ ${(intervalMs/1000).toFixed(2)}s — overlays are permanent`;
 
       } else {
         // STOP
@@ -264,20 +286,17 @@
       }
     });
 
-    // Handle resolution changes BEFORE base is taken (so preview canvas follows)
+    // Keep preview sized correctly if resolution dropdown changes (pre-base only)
     resSel.addEventListener('change', () => {
-      if (!haveBase) { startPreviewLoop(); }
+      if (!haveBase) startPreviewLoop();
     });
 
-    // Clean up when leaving the page
+    // Cleanup
     window.addEventListener('beforeunload', () => {
       try { if (previewRAF) cancelAnimationFrame(previewRAF); } catch {}
       try { if (recordTimer) clearInterval(recordTimer); } catch {}
       try {
-        if (stream) {
-          const tracks = stream.getTracks ? stream.getTracks() : [];
-          tracks.forEach(t => { try { t.stop(); } catch {} });
-        }
+        if (stream) { const tracks = stream.getTracks?.()||[]; tracks.forEach(t=>{ try{t.stop();}catch{} }); }
       } catch {}
     });
   </script>
