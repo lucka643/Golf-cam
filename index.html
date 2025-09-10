@@ -1,111 +1,93 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <meta charset="UTF-8" />
-    <title>Interval Camera</title>
-    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
-    <style>
-      body { margin:0; background:black; font-family:sans-serif; }
-      button { cursor:pointer; }
-    </style>
-  </head>
-  <body>
-    <div id="root"></div>
+<head>
+  <meta charset="UTF-8" />
+  <title>Interval Camera (Simple)</title>
+  <style>
+    body { margin:0; background:black; color:white; font-family:sans-serif; }
+    #status { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.1); padding:6px; border-radius:6px; }
+    #controls { position:absolute; bottom:30px; left:0; right:0; display:flex; justify-content:center; gap:60px; }
+    button { cursor:pointer; font-size:16px; }
+    #baseBtn { width:80px; height:80px; border-radius:50%; background:white; border:2px solid black; }
+    #startBtn { width:100px; height:100px; border-radius:50%; background:red; border:3px solid white; color:white; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;"></video>
+  <canvas id="composite" style="position:absolute;top:10px;right:10px;width:240px;height:160px;border:1px solid white;"></canvas>
+  <canvas id="scratch" style="display:none;"></canvas>
 
-    <script type="text/babel">
-      const { useEffect, useRef, useState } = React;
+  <div id="status">Loading…</div>
+  <div id="controls">
+    <button id="baseBtn">Base</button>
+    <button id="startBtn" disabled>Start</button>
+  </div>
 
-      function IntervalCamera() {
-        const videoRef = useRef(null);
-        const compositeRef = useRef(null);
-        const scratchRef = useRef(null);
-        const [status, setStatus] = useState("Loading…");
-        const [hasBase, setHasBase] = useState(false);
-        const [overlayCount, setOverlayCount] = useState(0);
-        const [done, setDone] = useState(false);
+  <script>
+    const video = document.getElementById("video");
+    const composite = document.getElementById("composite");
+    const scratch = document.getElementById("scratch");
+    const statusEl = document.getElementById("status");
+    const baseBtn = document.getElementById("baseBtn");
+    const startBtn = document.getElementById("startBtn");
 
-        // Enable camera (no async/await for Babel safety)
-        useEffect(() => {
-          navigator.mediaDevices.getUserMedia({ video: true })
-            .then(stream => {
-              videoRef.current.srcObject = stream;
-              videoRef.current.play();
-              setStatus("Camera ready — tap Base");
-            })
-            .catch(() => {
-              setStatus("Camera blocked — UI still works");
-            });
-        }, []);
+    let hasBase = false;
+    let overlays = 0;
 
-        function grabFrame() {
-          const v = videoRef.current;
-          if (!v.videoWidth) return null;
-          const s = scratchRef.current;
-          s.width = v.videoWidth;
-          s.height = v.videoHeight;
-          const ctx = s.getContext("2d");
-          ctx.drawImage(v, 0, 0);
-          return s;
+    // Try to enable camera
+    navigator.mediaDevices.getUserMedia({ video: true })
+      .then(stream => {
+        video.srcObject = stream;
+        statusEl.textContent = "Camera ready — tap Base";
+      })
+      .catch(() => {
+        statusEl.textContent = "Camera blocked — still usable";
+      });
+
+    function grabFrame() {
+      if (!video.videoWidth) return null;
+      scratch.width = video.videoWidth;
+      scratch.height = video.videoHeight;
+      const ctx = scratch.getContext("2d");
+      ctx.drawImage(video, 0, 0);
+      return scratch;
+    }
+
+    baseBtn.onclick = () => {
+      const s = grabFrame();
+      if (!s) return;
+      composite.width = s.width;
+      composite.height = s.height;
+      const ctx = composite.getContext("2d");
+      ctx.globalAlpha = 1.0;
+      ctx.drawImage(s, 0, 0);
+      hasBase = true;
+      baseBtn.disabled = true;
+      startBtn.disabled = false;
+      statusEl.textContent = "Base captured — press Start";
+    };
+
+    startBtn.onclick = () => {
+      if (!hasBase) return;
+      startBtn.disabled = true;
+      overlays = 0;
+      const ctx = composite.getContext("2d");
+      const timer = setInterval(() => {
+        const s = grabFrame();
+        if (!s) return;
+        ctx.globalAlpha = 0.25;
+        ctx.drawImage(s, 0, 0, composite.width, composite.height);
+        overlays++;
+        statusEl.textContent = "Capturing — " + overlays;
+        if (overlays >= 10) {
+          clearInterval(timer);
+          statusEl.textContent = "Done!";
+          composite.style.width = "100%";
+          composite.style.height = "100%";
+          video.style.opacity = 0;
         }
-
-        function captureBase() {
-          const s = grabFrame();
-          if (!s) return;
-          const c = compositeRef.current;
-          c.width = s.width;
-          c.height = s.height;
-          const ctx = c.getContext("2d");
-          ctx.globalAlpha = 1.0;
-          ctx.drawImage(s, 0, 0);
-          setHasBase(true);
-          setStatus("Base captured — press Start");
-        }
-
-        function startCapture() {
-          if (!hasBase) return;
-          let taken = 0;
-          const timer = setInterval(() => {
-            const s = grabFrame();
-            if (!s) return;
-            const c = compositeRef.current;
-            const ctx = c.getContext("2d");
-            ctx.globalAlpha = 0.25;
-            ctx.drawImage(s, 0, 0, c.width, c.height);
-            taken++;
-            setOverlayCount(taken);
-            if (taken >= 10) {
-              clearInterval(timer);
-              setDone(true);
-              setStatus("Done!");
-            }
-          }, 200);
-        }
-
-        return (
-          <div style={{width:"100%",height:"100%",position:"relative"}}>
-            <video ref={videoRef} muted playsInline
-              style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"contain",opacity:done?0:1}} />
-            <canvas ref={compositeRef}
-              style={{position:"absolute",top:10,right:10,width:done?"100%":"240px",height:done?"100%":"160px",border:"1px solid white"}} />
-            <canvas ref={scratchRef} style={{display:"none"}} />
-
-            <div style={{position:"absolute",top:10,left:10,background:"rgba(255,255,255,0.1)",padding:"6px",borderRadius:"6px"}}>
-              {status}{overlayCount>0 && ` — ${overlayCount}`}
-            </div>
-
-            <div style={{position:"absolute",bottom:30,left:0,right:0,display:"flex",justifyContent:"center",gap:"60px"}}>
-              <button onClick={captureBase} disabled={hasBase}
-                style={{width:"80px",height:"80px",borderRadius:"50%",background:"white",border:"2px solid black",opacity:hasBase?0.4:1}}>Base</button>
-              <button onClick={startCapture} disabled={!hasBase||done}
-                style={{width:"100px",height:"100px",borderRadius:"50%",background:"red",border:"3px solid white",opacity:!hasBase||done?0.4:1,color:"white"}}>Start</button>
-            </div>
-          </div>
-        );
-      }
-
-      ReactDOM.createRoot(document.getElementById("root")).render(<IntervalCamera />);
-    </script>
-  </body>
+      }, 200);
+    };
+  </script>
+</body>
 </html>
