@@ -2,33 +2,33 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Composite — v2.4 (Equal-Checker Merge, No Base)</title>
+  <title>Golf Swing Composite — v2.6 (Pixel-Checker, Worker)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root { --box-w: min(80vw, 1000px); }
+    :root { --box-w: min(80vw, 1100px); }
     body { margin:0; background:#000; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
-    #version{ position:absolute; top:12px; right:12px; opacity:.85; font:600 12px/1 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
-    #status { position:absolute; top:12px; left:12px; background:rgba(255,255,255,.08); padding:6px 10px; border-radius:8px; font-size:14px; }
-    #feedWrap{ position:absolute; inset:0; display:grid; place-items:center; }
-    #feedCanvas{ width:var(--box-w); aspect-ratio:4/3; border:2px solid #fff; background:#000; display:block; }
-    #videoEl{ display:none; }
-    #controls{ position:absolute; left:0; right:0; bottom:18px; display:flex; flex-direction:column; align-items:center; gap:10px; }
-    .row{ display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
-    button{ cursor:pointer; font-size:16px; }
-    #startBtn{ width:110px; height:110px; border-radius:50%; background:#e10000; color:#fff; border:4px solid #fff; font-weight:700; }
+    #version { position:absolute; top:12px; right:12px; opacity:.85; font:600 12px/1 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+    #status  { position:absolute; top:12px; left:12px; background:rgba(255,255,255,.08); padding:6px 10px; border-radius:8px; font-size:14px; }
+    #feedWrap { position:absolute; inset:0; display:grid; place-items:center; }
+    #feedCanvas { width:var(--box-w); aspect-ratio:4/3; border:2px solid #fff; background:#000; display:block; }
+    #videoEl { display:none; }
+    #controls { position:absolute; left:0; right:0; bottom:18px; display:flex; flex-direction:column; align-items:center; gap:10px; }
+    .row { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
+    button { cursor:pointer; font-size:16px; }
+    #startBtn { width:110px; height:110px; border-radius:50%; background:#e10000; color:#fff; border:4px solid #fff; font-weight:700; }
     #resetBtn, #saveBtn { padding:10px 14px; border-radius:10px; background:#111; border:1px solid #555; color:#fff; }
-    label{ font-size:14px; color:#ddd; display:flex; align-items:center; gap:8px; }
-    select{ appearance:none; background:#111; color:#fff; border:1px solid #555; border-radius:8px; padding:8px 10px; font-size:14px; min-width:130px; }
+    label { font-size:14px; color:#ddd; display:flex; align-items:center; gap:8px; }
+    select { appearance:none; background:#111; color:#fff; border:1px solid #555; border-radius:8px; padding:8px 10px; font-size:14px; min-width:130px; }
   </style>
 </head>
 <body>
-  <div id="version">v2.4</div>
+  <div id="version">v2.6</div>
   <div id="status">Loading…</div>
 
-  <!-- Hidden camera source -->
+  <!-- Hidden camera -->
   <video id="videoEl" autoplay playsinline muted></video>
 
-  <!-- Centered canvas: shows live (pre-capture) and the checker composite -->
+  <!-- Centered canvas -->
   <div id="feedWrap"><canvas id="feedCanvas"></canvas></div>
 
   <!-- Controls -->
@@ -54,205 +54,214 @@
   </div>
 
   <script>
-    // ====== Tunables ======
-    const TILE_PX = 4;               // checker tile size in pixels (smaller => finer mix)
-    const TARGET_LONG_EDGE = 1920;   // aim ~1080p long edge (falls back to 1280/640 if camera lower)
-    const PREVIEW_SMOOTHING = true;  // nicer preview scaling
+    /* ===== Fast pixel-checker mixer (no base) =====
+       Each pixel position is assigned to a frame using a fixed random
+       permutation P and rule: frame = P[pixel] % F, where F = #frames.
+       That gives an (almost) equal share per frame, at **near-pixel size**.
+       Mixing happens in a Web Worker, so the UI stays smooth.            */
 
-    // ====== Elements ======
+    // ---- Tunables ----
+    const TARGET_LONG_EDGE = 1280; // good speed/quality on iPad; raise to 1920 if you want
+    const PREVIEW_SMOOTHING = true;
+
+    // ---- Elements ----
     const videoEl    = document.getElementById('videoEl');
     const feedCanvas = document.getElementById('feedCanvas');
+    const cctx       = feedCanvas.getContext('2d', { willReadFrequently:true });
     const statusEl   = document.getElementById('status');
     const startBtn   = document.getElementById('startBtn');
     const resetBtn   = document.getElementById('resetBtn');
     const saveBtn    = document.getElementById('saveBtn');
     const intSel     = document.getElementById('interval');
 
-    // Offscreen capture canvas (same size as feedCanvas pixels)
+    // Offscreen capture canvas
     const frameCanvas = document.createElement('canvas');
     const fctx        = frameCanvas.getContext('2d', { willReadFrequently:true });
 
-    // Visible canvas context
-    const cctx        = feedCanvas.getContext('2d', { willReadFrequently:true });
-
     // State
     let stream=null, previewRAF=null, capturing=false, timer=null;
-    let frames = [];          // array of offscreen canvases (one per captured frame)
-    let tilesX=0, tilesY=0, tileCount=0, perm=null; // permutation for uniform tile distribution
+    let W=0, H=0;
+    let worker=null;    // Web Worker that holds frames + composes
+    let ready=false;    // worker ready with permutation
 
-    // ====== Helpers ======
-    function pickTargetMax(vw, vh) {
-      const m = Math.max(vw, vh);
+    // ---- Helpers ----
+    function pickTargetMax(vw, vh){
+      const m=Math.max(vw,vh);
+      if (TARGET_LONG_EDGE <= m) return TARGET_LONG_EDGE;
       if (m >= 1920) return 1920;
       if (m >= 1280) return 1280;
       return 640;
     }
-
-    function initCanvasSizes() {
-      const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
-      if (!vw || !vh) return false;
-      const target = Math.min(TARGET_LONG_EDGE, pickTargetMax(vw,vh));
-      const scale  = target / Math.max(vw, vh);
-      const cw = Math.max(1, Math.round(vw * scale));
-      const ch = Math.max(1, Math.round(vh * scale));
-      if (feedCanvas.width !== cw || feedCanvas.height !== ch) {
-        feedCanvas.width = cw; feedCanvas.height = ch;
-        frameCanvas.width = cw; frameCanvas.height = ch;
-
-        // compute tile grid
-        tilesX = Math.ceil(cw / TILE_PX);
-        tilesY = Math.ceil(ch / TILE_PX);
-        tileCount = tilesX * tilesY;
-
-        // precompute a random permutation of tile indices (for nice spatial mixing)
-        perm = new Uint32Array(tileCount);
-        for (let i=0;i<tileCount;i++) perm[i]=i;
-        // Fisher–Yates shuffle
-        for (let i=tileCount-1;i>0;i--) {
-          const j = (Math.random() * (i+1)) | 0;
-          const t = perm[i]; perm[i] = perm[j]; perm[j] = t;
-        }
+    function initCanvasSizes(){
+      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
+      if(!vw||!vh) return false;
+      const target = pickTargetMax(vw,vh);
+      const sc = target / Math.max(vw,vh);
+      const cw = Math.max(1, Math.round(vw*sc));
+      const ch = Math.max(1, Math.round(vh*sc));
+      if (feedCanvas.width!==cw || feedCanvas.height!==ch){
+        feedCanvas.width=cw; feedCanvas.height=ch;
+        frameCanvas.width=cw; frameCanvas.height=ch;
+        W=cw; H=ch;
+        // (Re)start worker with the new size
+        initWorker(W,H);
       }
       return true;
     }
-
-    function drawPreview() {
+    function drawPreview(){
       cancelAnimationFrame(previewRAF);
-      const tick = () => {
-        const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
-        if (vw && vh) {
+      const tick=()=>{
+        const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
+        if(vw&&vh){
           initCanvasSizes();
-          if (PREVIEW_SMOOTHING) {
-            cctx.imageSmoothingEnabled = true;
-            cctx.imageSmoothingQuality = 'high';
-          }
-          cctx.globalAlpha = 1;
-          cctx.globalCompositeOperation = 'source-over';
-          cctx.drawImage(videoEl, 0, 0, feedCanvas.width, feedCanvas.height);
+          if(PREVIEW_SMOOTHING){ cctx.imageSmoothingEnabled=true; cctx.imageSmoothingQuality='high'; }
+          cctx.globalAlpha=1; cctx.globalCompositeOperation='source-over';
+          cctx.drawImage(videoEl,0,0,feedCanvas.width,feedCanvas.height);
         }
-        previewRAF = requestAnimationFrame(tick);
+        previewRAF=requestAnimationFrame(tick);
       };
-      previewRAF = requestAnimationFrame(tick);
+      previewRAF=requestAnimationFrame(tick);
     }
-
-    function grabFrame() {
-      // draw current video frame into frameCanvas at composite size
-      fctx.globalAlpha = 1;
-      fctx.globalCompositeOperation = 'source-over';
-      fctx.drawImage(videoEl, 0, 0, frameCanvas.width, frameCanvas.height);
-
-      // store snapshot as its own offscreen canvas (so it doesn't change)
-      const snap = document.createElement('canvas');
-      snap.width = frameCanvas.width; snap.height = frameCanvas.height;
-      snap.getContext('2d').drawImage(frameCanvas, 0, 0);
-      frames.push(snap);
+    function grabFrameToBuffer(){
+      fctx.globalAlpha=1;
+      fctx.globalCompositeOperation='source-over';
+      fctx.drawImage(videoEl,0,0,W,H);
+      const img = fctx.getImageData(0,0,W,H);
+      // copy to a fresh buffer and transfer to worker (zero-copy via transferables)
+      const copy = new Uint8ClampedArray(img.data); // copy once; avoids locking canvas buffer
+      return copy.buffer;
     }
-
-    function recompositeChecker() {
-      // Equal distribution: for each tile, pick frame = perm[tile] % frames.length
-      const F = frames.length;
-      if (!F) return;
-
-      const cw = feedCanvas.width, ch = feedCanvas.height;
-      cctx.clearRect(0,0,cw,ch);
-
-      for (let ty=0; ty<tilesY; ty++) {
-        for (let tx=0; tx<tilesX; tx++) {
-          const tileIndex = ty*tilesX + tx;
-          const bucket = perm[tileIndex] % F; // ensures near-equal usage of frames
-          const src = frames[bucket];
-
-          const sx = tx * TILE_PX, sy = ty * TILE_PX;
-          const sw = Math.min(TILE_PX, cw - sx);
-          const sh = Math.min(TILE_PX, ch - sy);
-
-          // copy that tile from the chosen frame into the composite
-          cctx.drawImage(src, sx, sy, sw, sh, sx, sy, sw, sh);
-        }
-      }
-    }
-
-    function resetAll() {
-      try { if (previewRAF) cancelAnimationFrame(previewRAF); } catch {}
-      try { if (timer) clearInterval(timer); } catch {}
+    function resetAll(){
+      try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
+      try{ if(timer) clearInterval(timer); }catch{}
       previewRAF=null; timer=null; capturing=false;
-      frames.length = 0;
       cctx.clearRect(0,0,feedCanvas.width,feedCanvas.height);
+      statusEl.textContent='Reset — ready';
+      startBtn.textContent='Start';
+      startBtn.style.background='#e10000';
+      if(worker){ worker.terminate(); worker=null; ready=false; }
       drawPreview();
-      statusEl.textContent = 'Reset — ready';
-      startBtn.textContent = 'Start';
-      startBtn.style.background = '#e10000';
     }
-
-    function savePNG() {
+    function savePNG(){
       const url = feedCanvas.toDataURL('image/png');
-      const a = document.createElement('a');
-      a.href = url; a.download = 'composite-v2.4.png';
+      const a=document.createElement('a'); a.href=url; a.download='composite-v2.6.png';
       document.body.appendChild(a); a.click(); a.remove();
     }
 
-    // ====== Camera init (prefer rear) ======
+    // ---- Worker (inline) ----
+    function initWorker(width,height){
+      if(worker) { worker.terminate(); worker=null; ready=false; }
+      const code = `
+        let W=0,H=0,N=0, perm=null, frames=[];
+        function mulberry32(a){ return function(){let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
+        function buildPermutation(N, seed){
+          // Fisher–Yates on Uint32 indices (fast enough once)
+          const p = new Uint32Array(N);
+          for(let i=0;i<N;i++) p[i]=i;
+          const rand = mulberry32(seed>>>0);
+          for(let i=N-1;i>0;i--){
+            const j = (rand()*(i+1))|0;
+            const t=p[i]; p[i]=p[j]; p[j]=t;
+          }
+          return p;
+        }
+        onmessage = async (e)=>{
+          const d=e.data;
+          if(d.type==='init'){
+            W=d.W|0; H=d.H|0; N=W*H;
+            frames.length=0;
+            // seed with size for deterministic shuffle per size
+            perm = buildPermutation(N, (W*73856093)^(H*19349663));
+            postMessage({type:'ready'});
+          } else if(d.type==='add'){
+            // receive frame buffer (transfer ownership)
+            const arr = new Uint8ClampedArray(d.buf);
+            frames.push(arr);
+            if(frames.length>0 && frames.length%2===0){ /* optional noop */ }
+          } else if(d.type==='compose'){
+            if(frames.length===0){ postMessage({type:'composed', empty:true}); return; }
+            const F = frames.length;
+            const out = new Uint8ClampedArray(N*4);
+            // Per-pixel equal assignment: src frame = perm[p] % F
+            for(let p=0,i=0;p<N;p++,i+=4){
+              const src = frames[ perm[p] % F ];
+              out[i  ] = src[i  ];
+              out[i+1] = src[i+1];
+              out[i+2] = src[i+2];
+              out[i+3] = 255;
+            }
+            postMessage({type:'composed', buf: out.buffer}, [out.buffer]);
+          } else if(d.type==='reset'){
+            frames.length=0;
+          }
+        };
+      `;
+      worker = new Worker(URL.createObjectURL(new Blob([code],{type:'application/javascript'})));
+      worker.onmessage = (e)=>{
+        const d=e.data;
+        if(d.type==='ready'){ ready=true; statusEl.textContent='Ready — press Start'; }
+        else if(d.type==='composed'){
+          if(d.empty) return;
+          const arr = new Uint8ClampedArray(d.buf);
+          const img = new ImageData(arr, W, H);
+          cctx.putImageData(img, 0, 0);
+        }
+      };
+      worker.postMessage({type:'init', W:width, H:height});
+    }
+
+    // ---- Camera init (prefer rear) ----
     (async function initCamera(){
-      statusEl.textContent = 'Requesting camera…';
+      statusEl.textContent='Requesting camera…';
       const tries = [
-        { video:{ facingMode:{ exact:'environment' } }, audio:false },
-        { video:{ facingMode:{ ideal:'environment' } }, audio:false },
-        { video:{ facingMode:{ ideal:'user' } }, audio:false },
-        { video:true, audio:false }
+        {video:{facingMode:{exact:'environment'}},audio:false},
+        {video:{facingMode:{ideal:'environment'}},audio:false},
+        {video:{facingMode:{ideal:'user'}},audio:false},
+        {video:true,audio:false}
       ];
       let ok=false;
-      for (const c of tries) { try { stream = await navigator.mediaDevices.getUserMedia(c); ok=true; break; } catch {} }
-      if (!ok) { statusEl.textContent = 'Camera blocked/unavailable'; return; }
-      videoEl.srcObject = stream; try { await videoEl.play(); } catch {}
-      statusEl.textContent = 'Camera ready — press Start';
+      for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); ok=true; break; } catch{} }
+      if(!ok){ statusEl.textContent='Camera blocked/unavailable'; return; }
+      videoEl.srcObject=stream; try{ await videoEl.play(); }catch{}
+      statusEl.textContent='Camera ready — press Start';
       drawPreview();
     })();
 
-    // ====== Start/Stop capture ======
-    startBtn.addEventListener('click', () => {
-      if (!stream) return;
-
-      if (!capturing) {
+    // ---- Start/Stop capture ----
+    startBtn.addEventListener('click', ()=>{
+      if(!stream) return;
+      if(!capturing){
         // START
-        capturing = true;
-        startBtn.textContent = 'Stop';
-        startBtn.style.background = '#b00000';
-        // stop preview so we only see the composite as it builds
-        try { cancelAnimationFrame(previewRAF); } catch {} previewRAF=null;
-
-        // ensure canvases sized
-        if (!initCanvasSizes()) return;
-
-        const intervalMs = Math.max(10, parseInt(intSel.value || '200', 10));
-        timer = setInterval(() => {
-          grabFrame();
-          recompositeChecker();
-          statusEl.textContent = `Frames: ${frames.length} — checker equal mix`;
+        if(!initCanvasSizes()) return;
+        if(!ready){ statusEl.textContent='Preparing pattern…'; return; }
+        capturing=true; startBtn.textContent='Stop'; startBtn.style.background='#b00000';
+        try{ cancelAnimationFrame(previewRAF); }catch{} previewRAF=null;
+        const intervalMs = Math.max(10, parseInt(intSel.value||'200',10));
+        timer = setInterval(()=>{
+          const buf = grabFrameToBuffer();
+          worker.postMessage({type:'add', buf}, [buf]);   // transfer frame to worker
+          worker.postMessage({type:'compose'});           // ask worker to build composite
+          statusEl.textContent='Mixing frames equally (pixel-checker)…';
         }, intervalMs);
-
       } else {
         // STOP
-        capturing = false;
-        startBtn.textContent = 'Start';
-        startBtn.style.background = '#e10000';
-        if (timer) { clearInterval(timer); timer=null; }
-        statusEl.textContent = `Stopped — ${frames.length} frame(s) mixed equally`;
+        capturing=false; startBtn.textContent='Start'; startBtn.style.background='#e10000';
+        if(timer){ clearInterval(timer); timer=null; }
+        statusEl.textContent='Stopped — composite preserved';
       }
     });
 
     resetBtn.addEventListener('click', resetAll);
     saveBtn.addEventListener('click', savePNG);
 
-    // Cleanup on unload
-    window.addEventListener('beforeunload', () => {
-      try { if (previewRAF) cancelAnimationFrame(previewRAF); } catch {}
-      try { if (timer) clearInterval(timer); } catch {}
-      try {
-        if (stream) {
-          const tracks = stream.getTracks ? stream.getTracks() : [];
-          tracks.forEach(t => { try { t.stop(); } catch {} });
-        }
-      } catch {}
+    // Cleanup
+    window.addEventListener('beforeunload', ()=>{
+      try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
+      try{ if(timer) clearInterval(timer); }catch{}
+      try{
+        if(stream){ const tracks=stream.getTracks?stream.getTracks():[]; tracks.forEach(t=>{ try{t.stop();}catch{} }); }
+      }catch{}
+      if(worker) worker.terminate();
     });
   </script>
 </body>
