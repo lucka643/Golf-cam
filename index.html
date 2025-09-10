@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Overlay Camera</title>
+  <title>Golf Swing Permanent Overlay Camera</title>
   <style>
     body { margin:0; background:black; color:white; font-family:sans-serif; }
     #status { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.1); padding:6px; border-radius:6px; }
@@ -57,6 +57,7 @@
     const intSel = document.getElementById("interval");
 
     let hasBase = false;
+    let recording = false;
 
     // Use back camera when available
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
@@ -86,6 +87,7 @@
       feedBox.width = Math.round(s.width * scale);
       feedBox.height = Math.round(s.height * scale);
       const ctx = feedBox.getContext("2d");
+      ctx.clearRect(0, 0, feedBox.width, feedBox.height);
       ctx.globalAlpha = 1.0; // base solid
       ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
       hasBase = true;
@@ -97,15 +99,18 @@
     startBtn.onclick = () => {
       if (!hasBase) return;
       startBtn.disabled = true;
+      recording = true;
       const ctx = feedBox.getContext("2d");
       const interval = parseInt(intSel.value);
 
       setInterval(() => {
+        if (!recording) return;
         const s = grabFrame();
         if (!s) return;
-        // Each frame is permanently stamped at 75% transparency
+        // Stamp each frame permanently at 75% transparency
         ctx.globalAlpha = 0.75;
         ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
+        statusEl.textContent = "Overlay stamped at " + new Date().toLocaleTimeString();
       }, interval);
       statusEl.textContent = "Recording overlays…";
     };
