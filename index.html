@@ -20,33 +20,45 @@
       function IntervalCamera() {
         const videoRef = useRef(null);
         const compositeRef = useRef(null);
+        const scratchRef = useRef(null);
         const [status, setStatus] = useState("Loading…");
         const [hasBase, setHasBase] = useState(false);
         const [overlayCount, setOverlayCount] = useState(0);
         const [done, setDone] = useState(false);
 
-        // Try to enable camera
+        // Enable camera (no async/await for Babel safety)
         useEffect(() => {
-          async function enable() {
-            try {
-              const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          navigator.mediaDevices.getUserMedia({ video: true })
+            .then(stream => {
               videoRef.current.srcObject = stream;
-              await videoRef.current.play();
+              videoRef.current.play();
               setStatus("Camera ready — tap Base");
-            } catch {
+            })
+            .catch(() => {
               setStatus("Camera blocked — UI still works");
-            }
-          }
-          enable();
+            });
         }, []);
 
-        function captureBase() {
+        function grabFrame() {
           const v = videoRef.current;
-          const c = compositeRef.current;
-          c.width = v.videoWidth;
-          c.height = v.videoHeight;
-          const ctx = c.getContext("2d");
+          if (!v.videoWidth) return null;
+          const s = scratchRef.current;
+          s.width = v.videoWidth;
+          s.height = v.videoHeight;
+          const ctx = s.getContext("2d");
           ctx.drawImage(v, 0, 0);
+          return s;
+        }
+
+        function captureBase() {
+          const s = grabFrame();
+          if (!s) return;
+          const c = compositeRef.current;
+          c.width = s.width;
+          c.height = s.height;
+          const ctx = c.getContext("2d");
+          ctx.globalAlpha = 1.0;
+          ctx.drawImage(s, 0, 0);
           setHasBase(true);
           setStatus("Base captured — press Start");
         }
@@ -54,12 +66,13 @@
         function startCapture() {
           if (!hasBase) return;
           let taken = 0;
-          const v = videoRef.current;
-          const c = compositeRef.current;
-          const ctx = c.getContext("2d");
           const timer = setInterval(() => {
+            const s = grabFrame();
+            if (!s) return;
+            const c = compositeRef.current;
+            const ctx = c.getContext("2d");
             ctx.globalAlpha = 0.25;
-            ctx.drawImage(v, 0, 0, c.width, c.height);
+            ctx.drawImage(s, 0, 0, c.width, c.height);
             taken++;
             setOverlayCount(taken);
             if (taken >= 10) {
@@ -72,43 +85,21 @@
 
         return (
           <div style={{width:"100%",height:"100%",position:"relative"}}>
-            {/* Video feed */}
             <video ref={videoRef} muted playsInline
-              style={{
-                position:"absolute",inset:0,width:"100%",height:"100%",
-                objectFit:"contain",opacity:done?0:1
-              }}
-            />
-            {/* Composite preview/result */}
+              style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"contain",opacity:done?0:1}} />
             <canvas ref={compositeRef}
-              style={{
-                position:"absolute",top:10,right:10,
-                width:done?"100%":"240px",height:done?"100%":"160px",
-                border:"1px solid white"
-              }}
-            />
-            {/* Status */}
-            <div style={{
-              position:"absolute",top:10,left:10,
-              background:"rgba(255,255,255,0.1)",padding:"6px",borderRadius:"6px"
-            }}>{status}{overlayCount>0 && ` — ${overlayCount}`}</div>
-            {/* Controls */}
-            <div style={{
-              position:"absolute",bottom:30,left:0,right:0,
-              display:"flex",justifyContent:"center",gap:"60px"
-            }}>
+              style={{position:"absolute",top:10,right:10,width:done?"100%":"240px",height:done?"100%":"160px",border:"1px solid white"}} />
+            <canvas ref={scratchRef} style={{display:"none"}} />
+
+            <div style={{position:"absolute",top:10,left:10,background:"rgba(255,255,255,0.1)",padding:"6px",borderRadius:"6px"}}>
+              {status}{overlayCount>0 && ` — ${overlayCount}`}
+            </div>
+
+            <div style={{position:"absolute",bottom:30,left:0,right:0,display:"flex",justifyContent:"center",gap:"60px"}}>
               <button onClick={captureBase} disabled={hasBase}
-                style={{
-                  width:"80px",height:"80px",borderRadius:"50%",
-                  background:"white",border:"2px solid black",
-                  opacity:hasBase?0.4:1
-                }}>Base</button>
+                style={{width:"80px",height:"80px",borderRadius:"50%",background:"white",border:"2px solid black",opacity:hasBase?0.4:1}}>Base</button>
               <button onClick={startCapture} disabled={!hasBase||done}
-                style={{
-                  width:"100px",height:"100px",borderRadius:"50%",
-                  background:"red",border:"3px solid white",
-                  opacity:!hasBase||done?0.4:1,color:"white"
-                }}>Start</button>
+                style={{width:"100px",height:"100px",borderRadius:"50%",background:"red",border:"3px solid white",opacity:!hasBase||done?0.4:1,color:"white"}}>Start</button>
             </div>
           </div>
         );
