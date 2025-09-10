@@ -105,11 +105,13 @@
       setInterval(() => {
         const s = grabFrame();
         if (!s) return;
-        // Always redraw the base first (solid)
+        // Draw base permanently
         ctx.putImageData(baseImageData, 0, 0);
-        // Then blend new frame on top at 50% transparency
-        ctx.globalAlpha = 0.5;
+        // Then stack every previous overlay plus the new one
+        ctx.globalAlpha = 0.75;
         ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
+        // Update baseImageData to include this new blended frame permanently
+        baseImageData = ctx.getImageData(0, 0, feedBox.width, feedBox.height);
       }, interval);
       statusEl.textContent = "Recording overlays…";
     };
