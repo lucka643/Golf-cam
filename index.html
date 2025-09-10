@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Composite — v2.3 (Checker Merge)</title>
+  <title>Golf Swing Composite — v2.4 (Equal-Checker Merge, No Base)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --box-w: min(80vw, 1000px); }
@@ -15,35 +15,35 @@
     #controls{ position:absolute; left:0; right:0; bottom:18px; display:flex; flex-direction:column; align-items:center; gap:10px; }
     .row{ display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
     button{ cursor:pointer; font-size:16px; }
-    #baseBtn{ width:86px; height:86px; border-radius:50%; background:#fff; color:#000; border:2px solid #000; font-weight:600; }
     #startBtn{ width:110px; height:110px; border-radius:50%; background:#e10000; color:#fff; border:4px solid #fff; font-weight:700; }
-    #startBtn[disabled], #baseBtn[disabled]{ opacity:.45; cursor:default; }
+    #resetBtn, #saveBtn { padding:10px 14px; border-radius:10px; background:#111; border:1px solid #555; color:#fff; }
     label{ font-size:14px; color:#ddd; display:flex; align-items:center; gap:8px; }
     select{ appearance:none; background:#111; color:#fff; border:1px solid #555; border-radius:8px; padding:8px 10px; font-size:14px; min-width:130px; }
   </style>
 </head>
 <body>
-  <div id="version">v2.3</div>
+  <div id="version">v2.4</div>
   <div id="status">Loading…</div>
 
-  <!-- Camera source (hidden) -->
+  <!-- Hidden camera source -->
   <video id="videoEl" autoplay playsinline muted></video>
 
-  <!-- Centered canvas: live (pre-base) → base (solid) → checker-merged overlays -->
+  <!-- Centered canvas: shows live (pre-capture) and the checker composite -->
   <div id="feedWrap"><canvas id="feedCanvas"></canvas></div>
 
   <!-- Controls -->
   <div id="controls">
     <div class="row">
-      <button id="baseBtn">Base</button>
-      <button id="startBtn" disabled>Start</button>
+      <button id="startBtn">Start</button>
+      <button id="resetBtn">Reset</button>
+      <button id="saveBtn">Save</button>
     </div>
     <div class="row">
       <label>Interval
         <select id="interval">
           <option value="50">0.05s</option>
-          <option value="100" selected>0.10s</option>
-          <option value="200">0.20s</option>
+          <option value="100">0.10s</option>
+          <option value="200" selected>0.20s</option>
           <option value="300">0.30s</option>
           <option value="400">0.40s</option>
           <option value="500">0.50s</option>
@@ -54,252 +54,205 @@
   </div>
 
   <script>
-    /* =========================
-       Checker-merge parameters
-       ========================= */
-    const OVERLAY_ALPHA    = 0.65; // overlay strength; base stays more prominent
-    const DIFF_THRESH      = 20;   // luma threshold vs base (0..255)
-    const CONFIRM_FRAMES   = 2;    // pixel must be “moving” this many consecutive ticks
-    const DILATE_ITERS     = 1;    // fill pinholes
-    const ERODE_ITERS      = 0;    // tighten edges (0 or 1)
-    // Checker settings: image is partitioned into TILE×TILE buckets; each new frame
-    // only writes the bucket that matches frameIndex % BUCKETS. Pixels are “owned”
-    // once written → no overlay ever paints over another.
-    const TILE  = 4;               // 4×4 checker cell → 16 buckets
-    const BUCKETS = TILE * TILE;   // max distinct overlay “slots”
+    // ====== Tunables ======
+    const TILE_PX = 4;               // checker tile size in pixels (smaller => finer mix)
+    const TARGET_LONG_EDGE = 1920;   // aim ~1080p long edge (falls back to 1280/640 if camera lower)
+    const PREVIEW_SMOOTHING = true;  // nicer preview scaling
 
-    /* =========================
-       Elements / globals
-       ========================= */
+    // ====== Elements ======
     const videoEl    = document.getElementById('videoEl');
     const feedCanvas = document.getElementById('feedCanvas');
-    const cctx       = feedCanvas.getContext('2d', { willReadFrequently:true });
     const statusEl   = document.getElementById('status');
-    const baseBtn    = document.getElementById('baseBtn');
     const startBtn   = document.getElementById('startBtn');
+    const resetBtn   = document.getElementById('resetBtn');
+    const saveBtn    = document.getElementById('saveBtn');
     const intSel     = document.getElementById('interval');
 
-    const scratch    = document.createElement('canvas');
-    const sctx       = scratch.getContext('2d', { willReadFrequently:true });
+    // Offscreen capture canvas (same size as feedCanvas pixels)
+    const frameCanvas = document.createElement('canvas');
+    const fctx        = frameCanvas.getContext('2d', { willReadFrequently:true });
 
-    let stream=null, previewRAF=null, haveBase=false, recording=false, recordTimer=null;
+    // Visible canvas context
+    const cctx        = feedCanvas.getContext('2d', { willReadFrequently:true });
 
-    // Pixel buffers
-    let compositeImage=null, comp=null;   // what’s shown (ImageData + Uint8 view)
-    let baseImage=null, base=null;        // base reference pixels
-    let writtenMap=null;                  // Uint8: 0=base-only, >0 means claimed by some overlay
-    let hot=null;                         // Uint8: consecutive-motion counter (per pixel)
-    let bucketLUT=null;                   // Uint8: precomputed checker bucket index per pixel
-    let frameIndex=0;                     // increments each capture (selects bucket)
+    // State
+    let stream=null, previewRAF=null, capturing=false, timer=null;
+    let frames = [];          // array of offscreen canvases (one per captured frame)
+    let tilesX=0, tilesY=0, tileCount=0, perm=null; // permutation for uniform tile distribution
 
-    /* =========================
-       Utilities
-       ========================= */
-    function pickTargetMax(vw, vh){ const m=Math.max(vw,vh); return m>=1920?1920:(m>=1280?1280:640); }
-
-    function setCanvasSizeTo(targetMax){
-      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
-      const sc=targetMax/Math.max(vw,vh);
-      const cw=Math.max(1,Math.round(vw*sc));
-      const ch=Math.max(1,Math.round(vh*sc));
-      if(feedCanvas.width!==cw||feedCanvas.height!==ch){
-        feedCanvas.width=cw; feedCanvas.height=ch;
-        scratch.width=cw; scratch.height=ch;
-      }
-      return {cw,ch};
+    // ====== Helpers ======
+    function pickTargetMax(vw, vh) {
+      const m = Math.max(vw, vh);
+      if (m >= 1920) return 1920;
+      if (m >= 1280) return 1280;
+      return 640;
     }
 
-    function drawFrameToScratch(){
-      if(!scratch.width||!scratch.height) return false;
-      sctx.globalAlpha=1; sctx.globalCompositeOperation='source-over';
-      sctx.drawImage(videoEl,0,0,scratch.width,scratch.height);
+    function initCanvasSizes() {
+      const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
+      if (!vw || !vh) return false;
+      const target = Math.min(TARGET_LONG_EDGE, pickTargetMax(vw,vh));
+      const scale  = target / Math.max(vw, vh);
+      const cw = Math.max(1, Math.round(vw * scale));
+      const ch = Math.max(1, Math.round(vh * scale));
+      if (feedCanvas.width !== cw || feedCanvas.height !== ch) {
+        feedCanvas.width = cw; feedCanvas.height = ch;
+        frameCanvas.width = cw; frameCanvas.height = ch;
+
+        // compute tile grid
+        tilesX = Math.ceil(cw / TILE_PX);
+        tilesY = Math.ceil(ch / TILE_PX);
+        tileCount = tilesX * tilesY;
+
+        // precompute a random permutation of tile indices (for nice spatial mixing)
+        perm = new Uint32Array(tileCount);
+        for (let i=0;i<tileCount;i++) perm[i]=i;
+        // Fisher–Yates shuffle
+        for (let i=tileCount-1;i>0;i--) {
+          const j = (Math.random() * (i+1)) | 0;
+          const t = perm[i]; perm[i] = perm[j]; perm[j] = t;
+        }
+      }
       return true;
     }
 
-    function startPreviewLoop(){
+    function drawPreview() {
       cancelAnimationFrame(previewRAF);
-      const tick=()=>{
-        if(haveBase) return;
-        const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
-        if(vw&&vh){
-          const {cw,ch}=setCanvasSizeTo(pickTargetMax(vw,vh));
-          cctx.globalAlpha=1; cctx.globalCompositeOperation='source-over';
-          cctx.drawImage(videoEl,0,0,cw,ch);
+      const tick = () => {
+        const vw = videoEl.videoWidth|0, vh = videoEl.videoHeight|0;
+        if (vw && vh) {
+          initCanvasSizes();
+          if (PREVIEW_SMOOTHING) {
+            cctx.imageSmoothingEnabled = true;
+            cctx.imageSmoothingQuality = 'high';
+          }
+          cctx.globalAlpha = 1;
+          cctx.globalCompositeOperation = 'source-over';
+          cctx.drawImage(videoEl, 0, 0, feedCanvas.width, feedCanvas.height);
         }
-        previewRAF=requestAnimationFrame(tick);
+        previewRAF = requestAnimationFrame(tick);
       };
-      previewRAF=requestAnimationFrame(tick);
+      previewRAF = requestAnimationFrame(tick);
     }
 
-    function buildBucketLUT(W,H){
-      const out=new Uint8Array(W*H);
-      for(let y=0; y<H; y++){
-        let rowOffset=y*W;
-        for(let x=0; x<W; x++){
-          out[rowOffset+x] = (x % TILE) + TILE * (y % TILE); // 0..BUCKETS-1
+    function grabFrame() {
+      // draw current video frame into frameCanvas at composite size
+      fctx.globalAlpha = 1;
+      fctx.globalCompositeOperation = 'source-over';
+      fctx.drawImage(videoEl, 0, 0, frameCanvas.width, frameCanvas.height);
+
+      // store snapshot as its own offscreen canvas (so it doesn't change)
+      const snap = document.createElement('canvas');
+      snap.width = frameCanvas.width; snap.height = frameCanvas.height;
+      snap.getContext('2d').drawImage(frameCanvas, 0, 0);
+      frames.push(snap);
+    }
+
+    function recompositeChecker() {
+      // Equal distribution: for each tile, pick frame = perm[tile] % frames.length
+      const F = frames.length;
+      if (!F) return;
+
+      const cw = feedCanvas.width, ch = feedCanvas.height;
+      cctx.clearRect(0,0,cw,ch);
+
+      for (let ty=0; ty<tilesY; ty++) {
+        for (let tx=0; tx<tilesX; tx++) {
+          const tileIndex = ty*tilesX + tx;
+          const bucket = perm[tileIndex] % F; // ensures near-equal usage of frames
+          const src = frames[bucket];
+
+          const sx = tx * TILE_PX, sy = ty * TILE_PX;
+          const sw = Math.min(TILE_PX, cw - sx);
+          const sh = Math.min(TILE_PX, ch - sy);
+
+          // copy that tile from the chosen frame into the composite
+          cctx.drawImage(src, sx, sy, sw, sh, sx, sy, sw, sh);
         }
       }
-      return out;
     }
 
-    function dilate3x3(src,W,H,it=1){
-      let a=src, b=new Uint8Array(W*H);
-      for(let t=0;t<it;t++){
-        b.fill(0);
-        for(let y=1;y<H-1;y++){
-          let i=y*W+1;
-          for(let x=1;x<W-1;x++,i++){
-            const i0=i, i1=i-1, i2=i+1, i3=i-W, i4=i+W, i5=i3-1, i6=i3+1, i7=i4-1, i8=i4+1;
-            b[i]=(a[i0]|a[i1]|a[i2]|a[i3]|a[i4]|a[i5]|a[i6]|a[i7]|a[i8])?1:0;
-          }
-        }
-        a=b; b=new Uint8Array(W*H);
-      }
-      return a;
-    }
-    function erode3x3(src,W,H,it=1){
-      let a=src, b=new Uint8Array(W*H);
-      for(let t=0;t<it;t++){
-        b.fill(0);
-        for(let y=1;y<H-1;y++){
-          let i=y*W+1;
-          for(let x=1;x<W-1;x++,i++){
-            const i0=i, i1=i-1, i2=i+1, i3=i-W, i4=i+W, i5=i3-1, i6=i3+1, i7=i4-1, i8=i4+1;
-            b[i]=(a[i0]&a[i1]&a[i2]&a[i3]&a[i4]&a[i5]&a[i6]&a[i7]&a[i8])?1:0;
-          }
-        }
-        a=b; b=new Uint8Array(W*H);
-      }
-      return a;
+    function resetAll() {
+      try { if (previewRAF) cancelAnimationFrame(previewRAF); } catch {}
+      try { if (timer) clearInterval(timer); } catch {}
+      previewRAF=null; timer=null; capturing=false;
+      frames.length = 0;
+      cctx.clearRect(0,0,feedCanvas.width,feedCanvas.height);
+      drawPreview();
+      statusEl.textContent = 'Reset — ready';
+      startBtn.textContent = 'Start';
+      startBtn.style.background = '#e10000';
     }
 
-    function buildStableMask(curr,W,H){
-      const rW=.299, gW=.587, bW=.114;
-      const bin=new Uint8Array(W*H);
-      for(let p=0,i=0;p<bin.length;p++,i+=4){
-        const y1 = curr[i]*rW + curr[i+1]*gW + curr[i+2]*bW;
-        const y0 = base[i]*rW + base[i+1]*gW + base[i+2]*bW;
-        const d  = Math.abs(y1 - y0);
-        if(d>DIFF_THRESH){ if(hot[p]<255) hot[p]++; } else { hot[p]=0; }
-        bin[p] = (hot[p] >= CONFIRM_FRAMES) ? 1 : 0;
-      }
-      const d1 = dilate3x3(bin,W,H,DILATE_ITERS);
-      const e1 = (ERODE_ITERS>0)? erode3x3(d1,W,H,ERODE_ITERS) : d1;
-      return e1;
+    function savePNG() {
+      const url = feedCanvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url; a.download = 'composite-v2.4.png';
+      document.body.appendChild(a); a.click(); a.remove();
     }
 
-    /* =========================
-       Camera init (prefer rear)
-       ========================= */
+    // ====== Camera init (prefer rear) ======
     (async function initCamera(){
-      statusEl.textContent='Requesting camera…';
-      const tries=[
-        {video:{facingMode:{exact:'environment'}},audio:false},
-        {video:{facingMode:{ideal:'environment'}},audio:false},
-        {video:{facingMode:{ideal:'user'}},audio:false},
-        {video:true,audio:false}
+      statusEl.textContent = 'Requesting camera…';
+      const tries = [
+        { video:{ facingMode:{ exact:'environment' } }, audio:false },
+        { video:{ facingMode:{ ideal:'environment' } }, audio:false },
+        { video:{ facingMode:{ ideal:'user' } }, audio:false },
+        { video:true, audio:false }
       ];
       let ok=false;
-      for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); ok=true; break; }catch{} }
-      if(!ok){ statusEl.textContent='Camera blocked/unavailable'; return; }
-      videoEl.srcObject=stream; try{ await videoEl.play(); }catch{}
-      statusEl.textContent='Camera ready — frame your scene and press Base';
-      startPreviewLoop();
+      for (const c of tries) { try { stream = await navigator.mediaDevices.getUserMedia(c); ok=true; break; } catch {} }
+      if (!ok) { statusEl.textContent = 'Camera blocked/unavailable'; return; }
+      videoEl.srcObject = stream; try { await videoEl.play(); } catch {}
+      statusEl.textContent = 'Camera ready — press Start';
+      drawPreview();
     })();
 
-    /* =========================
-       Base capture (solid 100%)
-       ========================= */
-    baseBtn.addEventListener('click', ()=>{
-      if(haveBase) return;
-      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
-      if(!vw||!vh){ statusEl.textContent='No frame yet — try again'; return; }
-      const {cw,ch}=setCanvasSizeTo(pickTargetMax(vw,vh));
-      if(!drawFrameToScratch()){ statusEl.textContent='No frame yet — try again'; return; }
+    // ====== Start/Stop capture ======
+    startBtn.addEventListener('click', () => {
+      if (!stream) return;
 
-      // Draw base once
-      cctx.clearRect(0,0,cw,ch);
-      cctx.globalAlpha=1; cctx.globalCompositeOperation='source-over';
-      cctx.drawImage(scratch,0,0);
-
-      // Buffers
-      compositeImage = cctx.getImageData(0,0,cw,ch); comp = compositeImage.data;
-      baseImage      = cctx.getImageData(0,0,cw,ch); base = baseImage.data;
-      writtenMap     = new Uint8Array(cw*ch); // 0 initially
-      hot            = new Uint8Array(cw*ch); // 0 initially
-      bucketLUT      = buildBucketLUT(cw,ch);
-      frameIndex     = 0;
-
-      haveBase=true; baseBtn.disabled=true; startBtn.disabled=false;
-      statusEl.textContent='Base locked — press Start to record';
-      cancelAnimationFrame(previewRAF); previewRAF=null; // stop live preview
-    });
-
-    /* =========================
-       Start/Stop (checker merge)
-       ========================= */
-    startBtn.addEventListener('click', ()=>{
-      if(!haveBase) return;
-
-      if(!recording){
+      if (!capturing) {
         // START
-        recording=true; startBtn.textContent='Stop'; startBtn.style.background='#b00000';
-        const intervalMs=Math.max(10, parseInt(intSel.value||'100',10));
-        const W=feedCanvas.width, H=feedCanvas.height;
+        capturing = true;
+        startBtn.textContent = 'Stop';
+        startBtn.style.background = '#b00000';
+        // stop preview so we only see the composite as it builds
+        try { cancelAnimationFrame(previewRAF); } catch {} previewRAF=null;
 
-        recordTimer=setInterval(()=>{
-          if(!drawFrameToScratch()) return;
+        // ensure canvases sized
+        if (!initCanvasSizes()) return;
 
-          const frame = sctx.getImageData(0,0,W,H);
-          const fd    = frame.data;
-
-          // Stable motion mask
-          const mask = buildStableMask(fd,W,H);
-
-          const bucketTarget = frameIndex % BUCKETS;
-          const a=OVERLAY_ALPHA, ia=1-a;
-          let wrote=0;
-
-          // Checker write-once: only pixels in this frame's bucket AND not yet written
-          for(let p=0,i=0;p<mask.length;p++,i+=4){
-            if(mask[p]===1 && writtenMap[p]===0 && bucketLUT[p]===bucketTarget){
-              comp[i]   = (comp[i]  * ia + fd[i]   * a) | 0;
-              comp[i+1] = (comp[i+1]* ia + fd[i+1] * a) | 0;
-              comp[i+2] = (comp[i+2]* ia + fd[i+2] * a) | 0;
-              comp[i+3] = 255;
-              writtenMap[p]=bucketTarget+1; // remember owner bucket
-              wrote++;
-            }
-          }
-
-          if(wrote>0){ cctx.putImageData(compositeImage,0,0); }
-          statusEl.textContent = wrote>0
-            ? `Stamped bucket ${bucketTarget+1}/${BUCKETS} (+${wrote} px)`
-            : `Waiting for motion… (bucket ${bucketTarget+1}/${BUCKETS})`;
-
-          frameIndex++;
+        const intervalMs = Math.max(10, parseInt(intSel.value || '200', 10));
+        timer = setInterval(() => {
+          grabFrame();
+          recompositeChecker();
+          statusEl.textContent = `Frames: ${frames.length} — checker equal mix`;
         }, intervalMs);
 
       } else {
         // STOP
-        recording=false; startBtn.textContent='Start'; startBtn.style.background='#e10000';
-        if(recordTimer){ clearInterval(recordTimer); recordTimer=null; }
-        statusEl.textContent='Recording stopped — composite preserved';
+        capturing = false;
+        startBtn.textContent = 'Start';
+        startBtn.style.background = '#e10000';
+        if (timer) { clearInterval(timer); timer=null; }
+        statusEl.textContent = `Stopped — ${frames.length} frame(s) mixed equally`;
       }
     });
 
-    /* =========================
-       Cleanup
-       ========================= */
-    window.addEventListener('beforeunload', ()=>{
-      try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
-      try{ if(recordTimer) clearInterval(recordTimer); }catch{}
-      try{
-        if(stream){
-          const tracks=stream.getTracks?stream.getTracks():[];
-          tracks.forEach(t=>{ try{ t.stop(); }catch{} });
+    resetBtn.addEventListener('click', resetAll);
+    saveBtn.addEventListener('click', savePNG);
+
+    // Cleanup on unload
+    window.addEventListener('beforeunload', () => {
+      try { if (previewRAF) cancelAnimationFrame(previewRAF); } catch {}
+      try { if (timer) clearInterval(timer); } catch {}
+      try {
+        if (stream) {
+          const tracks = stream.getTracks ? stream.getTracks() : [];
+          tracks.forEach(t => { try { t.stop(); } catch {} });
         }
-      }catch{}
+      } catch {}
     });
   </script>
 </body>
