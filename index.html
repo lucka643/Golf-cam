@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Interval Camera (Base Solid)</title>
+  <title>Interval Camera (Snapshot Base + Overlays)</title>
   <style>
     body { margin:0; background:black; color:white; font-family:sans-serif; }
     #status { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.1); padding:6px; border-radius:6px; }
@@ -43,12 +43,6 @@
           <option value="1000">1s</option>
         </select>
       </label>
-      <label>Transparency: 
-        <select id="alpha">
-          <option value="0.75" selected>75%</option>
-          <option value="0.5">50%</option>
-        </select>
-      </label>
     </div>
   </div>
 
@@ -61,7 +55,6 @@
     const startBtn = document.getElementById("startBtn");
     const resSel = document.getElementById("resolution");
     const intSel = document.getElementById("interval");
-    const alphaSel = document.getElementById("alpha");
 
     let hasBase = false;
 
@@ -71,25 +64,10 @@
         video.srcObject = stream;
         video.play();
         statusEl.textContent = "Camera ready — tap Base";
-        drawLiveFeed();
       })
       .catch(() => {
         statusEl.textContent = "Camera blocked — still usable";
       });
-
-    function drawLiveFeed() {
-      if (!video.videoWidth) {
-        requestAnimationFrame(drawLiveFeed);
-        return;
-      }
-      if (!hasBase) {
-        const ctx = feedBox.getContext("2d");
-        feedBox.width = video.videoWidth;
-        feedBox.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0, feedBox.width, feedBox.height);
-      }
-      requestAnimationFrame(drawLiveFeed);
-    }
 
     function grabFrame() {
       if (!video.videoWidth) return null;
@@ -108,12 +86,12 @@
       feedBox.width = Math.round(s.width * scale);
       feedBox.height = Math.round(s.height * scale);
       const ctx = feedBox.getContext("2d");
-      ctx.globalAlpha = 1.0; // base image solid
+      ctx.globalAlpha = 1.0; // base solid
       ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
       hasBase = true;
       baseBtn.disabled = true;
       startBtn.disabled = false;
-      statusEl.textContent = "Base captured — press Start";
+      statusEl.textContent = "Base snapshot taken — press Start";
     };
 
     startBtn.onclick = () => {
@@ -121,14 +99,13 @@
       startBtn.disabled = true;
       const ctx = feedBox.getContext("2d");
       const interval = parseInt(intSel.value);
-      const alpha = parseFloat(alphaSel.value);
       setInterval(() => {
         const s = grabFrame();
         if (!s) return;
-        ctx.globalAlpha = alpha; // overlays at chosen transparency
+        ctx.globalAlpha = 0.75; // overlays semi-transparent
         ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
       }, interval);
-      statusEl.textContent = "Recording…";
+      statusEl.textContent = "Recording overlays…";
     };
   </script>
 </body>
