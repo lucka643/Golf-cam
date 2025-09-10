@@ -2,41 +2,50 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Composite — v3.0 (AI/Motion Gated)</title>
+  <title>Golf Swing Composite — v3.2 (Base-Diff + AI, Live PIP)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --box-w: min(80vw, 1100px); }
     body { margin:0; background:#000; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
     #version { position:absolute; top:12px; right:12px; opacity:.85; font:600 12px/1 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
     #status  { position:absolute; top:12px; left:12px; background:rgba(255,255,255,.08); padding:6px 10px; border-radius:8px; font-size:14px; }
-    #feedWrap { position:absolute; inset:0; display:grid; place-items:center; }
-    #feedCanvas { width:var(--box-w); aspect-ratio:4/3; border:2px solid #fff; background:#000; display:block; }
-    #videoEl { display:none; }
+    #stage   { position:absolute; inset:0; display:grid; place-items:center; }
+    #compCanvas { width:var(--box-w); aspect-ratio:4/3; border:2px solid #fff; background:#000; display:block; }
+    /* Live PIP so you can see camera is still running while recording */
+    #pipWrap { position:absolute; left:16px; bottom:16px; width:180px; background:#000; border:2px solid #fff; border-radius:8px; overflow:hidden; }
+    #pipWrap.hidden { display:none; }
+    #pipVideo { width:100%; height:auto; display:block; }
     #controls { position:absolute; left:0; right:0; bottom:18px; display:flex; flex-direction:column; align-items:center; gap:10px; }
     .row { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
     button { cursor:pointer; font-size:16px; }
+    #baseBtn { width:86px; height:86px; border-radius:50%; background:#fff; color:#000; border:2px solid #000; font-weight:600; }
     #startBtn { width:110px; height:110px; border-radius:50%; background:#e10000; color:#fff; border:4px solid #fff; font-weight:700; }
-    #resetBtn, #saveBtn { padding:10px 14px; border-radius:10px; background:#111; border:1px solid #555; color:#fff; }
+    #resetBtn, #saveBtn, #pipBtn { padding:10px 14px; border-radius:10px; background:#111; border:1px solid #555; color:#fff; }
+    #startBtn[disabled], #baseBtn[disabled] { opacity:.45; cursor:default; }
     label { font-size:14px; color:#ddd; display:flex; align-items:center; gap:8px; }
     select { appearance:none; background:#111; color:#fff; border:1px solid #555; border-radius:8px; padding:8px 10px; font-size:14px; min-width:130px; }
   </style>
 </head>
 <body>
-  <div id="version">v3.0</div>
+  <div id="version">v3.2</div>
   <div id="status">Loading…</div>
 
-  <!-- Hidden camera -->
-  <video id="videoEl" autoplay playsinline muted></video>
+  <!-- Centered result canvas (shows Base + permanent overlays) -->
+  <div id="stage">
+    <canvas id="compCanvas"></canvas>
+  </div>
 
-  <!-- Centered canvas -->
-  <div id="feedWrap"><canvas id="feedCanvas"></canvas></div>
+  <!-- Live camera PIP so it never “looks off” while recording -->
+  <div id="pipWrap"><video id="pipVideo" autoplay playsinline muted></video></div>
 
   <!-- Controls -->
   <div id="controls">
     <div class="row">
-      <button id="startBtn">Start</button>
+      <button id="baseBtn">Base</button>
+      <button id="startBtn" disabled>Start</button>
       <button id="resetBtn">Reset</button>
       <button id="saveBtn">Save</button>
+      <button id="pipBtn">PIP On/Off</button>
     </div>
     <div class="row">
       <label>Interval
@@ -52,7 +61,7 @@
       </label>
       <label>Focus
         <select id="focus">
-          <option value="motion" selected>Motion (fast)</option>
+          <option value="diff" selected>Base Diff (fast)</option>
           <option value="person">AI: Person</option>
           <option value="ball">AI: Sports ball</option>
         </select>
@@ -60,41 +69,57 @@
     </div>
   </div>
 
-  <!-- Optional TensorFlow.js + COCO-SSD (loaded only if AI focus chosen) -->
-  <script id="tfjs" defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js" onerror="this.dataset.fail=1" ></script>
+  <!-- Optional AI (auto-fallback if blocked) -->
+  <script id="tfjs" defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js" onerror="this.dataset.fail=1"></script>
   <script id="cocossd" defer src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js" onerror="this.dataset.fail=1"></script>
 
   <script>
-    /* =============================
-       v3.0 — AI/Motion Gated Mixer
-       =============================
-       - Worker maintains: background model, motion mask, write-once composite.
-       - Main thread: camera, UI, (optional) AI boxes for person/ball.
+    /* ===========================
+       v3.2 — Base-Diff + AI Gated
+       ===========================
+       - Base captured once (solid 100%) and drawn into composite.
+       - Each frame: compute mask of pixels that differ from Base.
+       - (Optional) Intersect with AI boxes (person / ball).
+       - Write-once commit at 0.75 alpha (older overlays never get touched).
+       - Live camera shown in PIP so it never looks “off” while recording.
     */
 
-    // Tunables (picked for stability/speed)
-    const TARGET_LONG_EDGE = 1280;   // raise to 1920 for more detail (slower)
-    const PREVIEW_SMOOTHING = true;
+    // Tunables
+    const TARGET_LONG_EDGE = 1280;   // raise to 1920 if you want more detail (slower)
+    const OVERLAY_ALPHA    = 0.75;   // overlay strength
+    const DIFF_THRESH      = 18;     // luma diff vs Base (0..255)
+    const CONFIRM_FRAMES   = 2;      // must differ for N consecutive ticks (reduces noise)
+    const DILATE_ITERS     = 1;      // fill pinholes
+    const ERODE_ITERS      = 0;      // tighten edges
+    const PREVIEW_SMOOTHING= true;
 
     // Elements
-    const videoEl    = document.getElementById('videoEl');
-    const feedCanvas = document.getElementById('feedCanvas');
-    const cctx       = feedCanvas.getContext('2d', { willReadFrequently:true });
-    const statusEl   = document.getElementById('status');
-    const startBtn   = document.getElementById('startBtn');
-    const resetBtn   = document.getElementById('resetBtn');
-    const saveBtn    = document.getElementById('saveBtn');
-    const intSel     = document.getElementById('interval');
-    const focusSel   = document.getElementById('focus');
+    const pipVideo  = document.getElementById('pipVideo');
+    const pipWrap   = document.getElementById('pipWrap');
+    const compCv    = document.getElementById('compCanvas');
+    const cctx      = compCv.getContext('2d', { willReadFrequently:true });
 
-    const frameCanvas = document.createElement('canvas');
-    const fctx        = frameCanvas.getContext('2d', { willReadFrequently:true });
+    const statusEl  = document.getElementById('status');
+    const versionEl = document.getElementById('version');
+
+    const baseBtn   = document.getElementById('baseBtn');
+    const startBtn  = document.getElementById('startBtn');
+    const resetBtn  = document.getElementById('resetBtn');
+    const saveBtn   = document.getElementById('saveBtn');
+    const pipBtn    = document.getElementById('pipBtn');
+
+    const intSel    = document.getElementById('interval');
+    const focusSel  = document.getElementById('focus');
+
+    // Offscreen same-size canvas to grab frames for worker & AI
+    const frameCv   = document.createElement('canvas');
+    const fctx      = frameCv.getContext('2d', { willReadFrequently:true });
 
     // State
-    let stream=null, previewRAF=null, capturing=false, timer=null;
+    let stream=null, capturing=false, timer=null, aiTick=null;
     let W=0, H=0;
-    let worker=null, ready=false;
-    let model=null, aiOn=false, aiKind='motion', aiTick=null;
+    let worker=null, ready=false, haveBase=false;
+    let model=null, aiOn=false, aiKind='diff';
 
     // Helpers
     function pickTargetMax(vw,vh){
@@ -104,86 +129,70 @@
       if (m>=1280) return 1280;
       return 640;
     }
-    function initCanvasSizes(){
-      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
+    function ensureSizes(){
+      const vw=pipVideo.videoWidth|0, vh=pipVideo.videoHeight|0;
       if(!vw||!vh) return false;
       const target = pickTargetMax(vw,vh);
       const sc = target/Math.max(vw,vh);
-      const cw = Math.max(1, Math.round(vw*sc));
-      const ch = Math.max(1, Math.round(vh*sc));
-      if (feedCanvas.width!==cw || feedCanvas.height!==ch){
-        feedCanvas.width=cw; feedCanvas.height=ch;
-        frameCanvas.width=cw; frameCanvas.height=ch;
+      const cw=Math.max(1,Math.round(vw*sc));
+      const ch=Math.max(1,Math.round(vh*sc));
+      if(compCv.width!==cw || compCv.height!==ch){
+        compCv.width=cw; compCv.height=ch;
+        frameCv.width=cw; frameCv.height=ch;
         W=cw; H=ch;
         initWorker(W,H);
       }
       return true;
     }
-    function drawPreview(){
-      cancelAnimationFrame(previewRAF);
-      const tick=()=>{
-        const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
-        if(vw&&vh){
-          initCanvasSizes();
-          if(PREVIEW_SMOOTHING){ cctx.imageSmoothingEnabled=true; cctx.imageSmoothingQuality='high'; }
-          cctx.globalAlpha=1; cctx.globalCompositeOperation='source-over';
-          cctx.drawImage(videoEl,0,0,feedCanvas.width,feedCanvas.height);
-        }
-        previewRAF=requestAnimationFrame(tick);
-      };
-      previewRAF=requestAnimationFrame(tick);
+    function drawBaseIntoComposite(){
+      cctx.clearRect(0,0,W,H);
+      cctx.drawImage(frameCv, 0,0,W,H);
+      // send base pixels to worker
+      const base = fctx.getImageData(0,0,W,H).data;
+      const baseCopy = new Uint8ClampedArray(base);
+      worker.postMessage({type:'setBase', buf: baseCopy.buffer}, [baseCopy.buffer]);
     }
     function grabFrameBuffer(){
       fctx.globalAlpha=1; fctx.globalCompositeOperation='source-over';
-      fctx.drawImage(videoEl,0,0,W,H);
+      fctx.drawImage(pipVideo, 0,0,W,H);
       const img = fctx.getImageData(0,0,W,H);
       return new Uint8ClampedArray(img.data).buffer;
     }
-    function resetAll(){
-      try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
-      try{ if(timer) clearInterval(timer); }catch{}
-      if(aiTick){ clearInterval(aiTick); aiTick=null; }
-      previewRAF=null; timer=null; capturing=false;
-      cctx.clearRect(0,0,feedCanvas.width,feedCanvas.height);
-      statusEl.textContent='Reset — ready';
-      startBtn.textContent='Start';
-      startBtn.style.background='#e10000';
-      if(worker){ worker.terminate(); worker=null; ready=false; }
-      drawPreview();
-    }
     function savePNG(){
-      const url=feedCanvas.toDataURL('image/png');
-      const a=document.createElement('a'); a.href=url; a.download='composite-v3.0.png'; document.body.appendChild(a); a.click(); a.remove();
+      const url=compCv.toDataURL('image/png');
+      const a=document.createElement('a'); a.href=url; a.download='composite-v3.2.png';
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+    function resetAll(){
+      try{ if(timer) clearInterval(timer); }catch{}
+      try{ if(aiTick) clearInterval(aiTick); }catch{}
+      capturing=false; haveBase=false;
+      startBtn.textContent='Start'; startBtn.style.background='#e10000'; startBtn.disabled=true;
+      baseBtn.disabled=false;
+      cctx.clearRect(0,0,compCv.width,compCv.height);
+      if(worker){ worker.terminate(); worker=null; ready=false; }
+      statusEl.textContent='Reset — frame your Base and press Base';
     }
 
-    // Worker (inline)
+    // Worker
     function initWorker(width,height){
       if(worker){ worker.terminate(); worker=null; ready=false; }
       const code = `
         let W=0,H=0,N=0;
-        let composite=null, comp=null;       // ImageData + Uint8 view
-        let written=null;                    // Uint8: 0/1 written map
-        let bg=null;                         // Float32 background RGB
-        let hot=null;                        // Uint8 consecutive motion counter
-        let lastMask=null;                   // Uint8 mask (0/1) last frame for debug
-        let params={ DIFF:18, CONFIRM:2, DILATE:1, ERODE:0, BG_ALPHA:0.02, ALPHA:1.0 }; // alpha=1 (solid, no brighten)
-        let gateBoxes=[];                    // AI gating boxes [{x,y,w,h}] in canvas coords
+        let base=null;                     // Uint8ClampedArray (Base pixels)
+        let composite=null, comp=null;     // ImageData + Uint8 view (result)
+        let written=null;                  // Uint8 per-pixel written map
+        let hot=null;                      // Uint8 temporal confirm counters
+        let params={ DIFF:18, CONFIRM:2, DILATE:1, ERODE:0, ALPHA:0.75 };
+        let boxes=[]; // AI boxes (optional)
 
         function setSize(w,h){
           W=w|0; H=h|0; N=W*H;
           composite = new ImageData(W,H);
           comp = composite.data;
           written = new Uint8Array(N);
-          bg = new Float32Array(N*3);
           hot = new Uint8Array(N);
-          lastMask = new Uint8Array(N);
-        }
-        function inBoxes(x,y){
-          if (gateBoxes.length===0) return true; // no AI: pass all
-          for (let b of gateBoxes){
-            if (x>=b.x && y>=b.y && x<b.x+b.w && y<b.y+b.h) return true;
-          }
-          return false;
+          base = null;
         }
         function dilate3x3(src,W,H,it=1){
           let a=src, b=new Uint8Array(W*H);
@@ -215,130 +224,126 @@
           }
           return a;
         }
+        function inBoxes(x,y){
+          if (boxes.length===0) return true; // no AI gate => accept all
+          for (let b of boxes){
+            if (x>=b.x && y>=b.y && x<b.x+b.w && y<b.y+b.h) return true;
+          }
+          return false;
+        }
 
         onmessage = (e)=>{
           const d=e.data;
           if(d.type==='init'){ setSize(d.W,d.H); postMessage({type:'ready'}); return; }
           if(d.type==='setParams'){ params = Object.assign(params, d.params||{}); return; }
-          if(d.type==='setBoxes'){ gateBoxes = d.boxes||[]; return; }
+          if(d.type==='setBoxes'){ boxes = d.boxes||[]; return; }
           if(d.type==='reset'){ setSize(W,H); return; }
-          if(d.type==='add'){
-            // frame buffer
-            const fd = new Uint8ClampedArray(d.buf);
-            // If bg is zero, initialize from first frame
-            if (bg[0]===0 && bg[1]===0 && bg[2]===0){
-              for(let p=0,i=0;p<N;p++,i+=4){ bg[i] = fd[i]; bg[i+1] = fd[i+1]; bg[i+2] = fd[i+2]; }
-            }
 
-            // Build motion mask vs background with temporal confirm
+          if(d.type==='setBase'){
+            // Store base pixels and also initialize composite = base (opaque)
+            const arr = new Uint8ClampedArray(d.buf);
+            base = arr;
+            for(let p=0,i=0;p<N;p++,i+=4){
+              comp[i]=base[i]; comp[i+1]=base[i+1]; comp[i+2]=base[i+2]; comp[i+3]=255;
+              written[p]=0; hot[p]=0;
+            }
+            postMessage({type:'composed', buf: composite.data.buffer}, [composite.data.buffer]);
+            composite = new ImageData(new Uint8ClampedArray(comp), W, H);
+            comp = composite.data;
+            return;
+          }
+
+          if(d.type==='add' && base){
+            const fd = new Uint8ClampedArray(d.buf); // current frame pixels
+
+            // Build diff mask vs base (with temporal confirm)
             const bin = new Uint8Array(N);
-            const TH = params.DIFF|0, CF=params.CONFIRM|0, a= params.BG_ALPHA;
+            const TH = params.DIFF|0, CF=params.CONFIRM|0;
             for(let p=0,i=0,y=0;y<H;y++){
               for(let x=0;x<W;x++,p++,i+=4){
-                const r=fd[i], g=fd[i+1], b=fd[i+2];
-                const dr = Math.abs(r - bg[i]);
-                const dg = Math.abs(g - bg[i+1]);
-                const db = Math.abs(b - bg[i+2]);
-                const dL = (0.299*dr + 0.587*dg + 0.114*db);
-                // update background slowly where we haven't yet written
-                if (written[p]===0){
-                  bg[i]   = bg[i]  * (1-a) + r * a;
-                  bg[i+1] = bg[i+1]*(1-a) + g * a;
-                  bg[i+2] = bg[i+2]*(1-a) + b * a;
-                }
+                const r1=fd[i], g1=fd[i+1], b1=fd[i+2];
+                const r0=base[i], g0=base[i+1], b0=base[i+2];
+                // luma diff
+                const dL = Math.abs(0.299*(r1-r0) + 0.587*(g1-g0) + 0.114*(b1-b0));
                 // AI gate
-                let gateOK = true;
-                if (gateBoxes.length>0){
-                  const gx = x, gy = y;
-                  gateOK = false;
-                  for (let B of gateBoxes){
-                    if (gx>=B.x && gy>=B.y && gx<B.x+B.w && gy<B.y+B.h){ gateOK=true; break; }
-                  }
-                }
-                if (gateOK && dL>TH){
-                  if (hot[p]<255) hot[p]++; 
-                } else {
-                  hot[p]=0;
-                }
-                bin[p] = (hot[p]>=CF)?1:0;
+                let ok = (dL>TH) && inBoxes(x,y);
+                if(ok){ if(hot[p]<255) hot[p]++; } else { hot[p]=0; }
+                bin[p] = (hot[p] >= CF) ? 1 : 0;
               }
             }
-            // Morphology
             let mask = bin;
             if((params.DILATE|0)>0) mask = dilate3x3(mask,W,H,params.DILATE|0);
             if((params.ERODE|0)>0)  mask = erode3x3(mask,W,H,params.ERODE|0);
-            lastMask = mask;
 
-            // Write-once commit
-            const oa = params.ALPHA; const ia = 1-oa;
+            // Write-once commit at alpha
+            const a=params.ALPHA, ia=1-a;
             for(let p=0,i=0;p<N;p++,i+=4){
               if(mask[p]===1 && written[p]===0){
-                // solid stamp (or blend if you want faint trails: use oa<1)
-                comp[i]   = (comp[i]  * ia + fd[i]   * oa) | 0;
-                comp[i+1] = (comp[i+1]* ia + fd[i+1] * oa) | 0;
-                comp[i+2] = (comp[i+2]* ia + fd[i+2] * oa) | 0;
+                comp[i]   = (comp[i]  * ia + fd[i]   * a) | 0;
+                comp[i+1] = (comp[i+1]* ia + fd[i+1] * a) | 0;
+                comp[i+2] = (comp[i+2]* ia + fd[i+2] * a) | 0;
                 comp[i+3] = 255;
                 written[p]=1;
               }
             }
+
             postMessage({type:'composed', buf: composite.data.buffer}, [composite.data.buffer]);
-            // restore view after transfer
             composite = new ImageData(new Uint8ClampedArray(comp), W, H);
             comp = composite.data;
+            return;
           }
         };
       `;
       worker = new Worker(URL.createObjectURL(new Blob([code],{type:'application/javascript'})));
       worker.onmessage = (e)=>{
         const d=e.data;
-        if(d.type==='ready'){ ready=true; statusEl.textContent='Ready — press Start'; }
-        else if(d.type==='composed'){
+        if(d.type==='ready'){ ready=true; statusEl.textContent='Ready — Set Base'; return; }
+        if(d.type==='composed'){
           const arr = new Uint8ClampedArray(d.buf);
           const img = new ImageData(arr, W, H);
           cctx.putImageData(img, 0, 0);
+          return;
         }
       };
       worker.postMessage({type:'init', W:width, H:height});
-      // default worker params (tuned)
-      worker.postMessage({type:'setParams', params:{ DIFF:18, CONFIRM:2, DILATE:1, ERODE:0, BG_ALPHA:0.02, ALPHA:1.0 }});
+      worker.postMessage({type:'setParams', params:{
+        DIFF:DIFF_THRESH, CONFIRM:CONFIRM_FRAMES, DILATE:DILATE_ITERS, ERODE:ERODE_ITERS, ALPHA:OVERLAY_ALPHA
+      }});
+      startBtn.disabled = !haveBase;
     }
 
-    // AI loader & polling
+    // AI (optional)
     async function ensureModel(){
-      if(model || aiOn===false) return;
+      if(model !== null) return;
       try{
         if(document.getElementById('tfjs')?.dataset.fail || document.getElementById('cocossd')?.dataset.fail) throw new Error('cdn blocked');
-        // wait for scripts to finish
-        if(!('cocoSsd' in window)){ await new Promise(r=>setTimeout(r,200)); }
-        model = await cocoSsd.load({base:'lite_mobilenet_v2'}); // lightest
+        if(!('cocoSsd' in window)){ await new Promise(r=>setTimeout(r,250)); }
+        model = await cocoSsd.load({base:'lite_mobilenet_v2'});
         statusEl.textContent='AI ready';
       }catch(e){
-        model=null; statusEl.textContent='AI failed — using motion only';
-        aiOn=false; focusSel.value='motion';
+        model=null; aiOn=false; focusSel.value='diff';
+        statusEl.textContent='AI failed — using Base Diff only';
       }
     }
-    function startAIPoll(){
+    function startAIGate(){
       if(aiTick){ clearInterval(aiTick); aiTick=null; }
-      if(!aiOn) return;
+      if(!aiOn){ worker?.postMessage({type:'setBoxes', boxes:[]}); return; }
       aiTick = setInterval(async ()=>{
         if(!model || !W || !H) return;
-        // run detection on small tensor (reuse frame canvas)
-        const preds = await model.detect(frameCanvas, 5);
+        // run detection on the latest frame buffer (frameCv already holds last grab)
+        const preds = await model.detect(frameCv, 5);
         const boxes=[];
         const want = (aiKind==='person') ? ['person'] : ['sports ball','sports_ball','sportsball','ball'];
         for(const p of preds){
           if(want.includes(p.class) && p.score>0.35){
-            // p.bbox = [x,y,width,height] in canvas pixels
             let [x,y,w,h] = p.bbox;
-            // pad a bit
-            const pad = 12;
-            x=Math.max(0,x-pad); y=Math.max(0,y-pad);
+            const pad=12; x=Math.max(0,x-pad); y=Math.max(0,y-pad);
             w=Math.min(W-x,w+pad*2); h=Math.min(H-y,h+pad*2);
             boxes.push({x:Math.round(x), y:Math.round(y), w:Math.round(w), h:Math.round(h)});
           }
         }
         worker?.postMessage({type:'setBoxes', boxes});
-      }, 300); // ~3 fps AI gating is enough
+      }, 300);
     }
 
     // Camera init (prefer rear)
@@ -351,57 +356,82 @@
         {video:true,audio:false}
       ];
       let ok=false;
-      for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); ok=true; break; } catch{} }
+      for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); ok=true; break; }catch{} }
       if(!ok){ statusEl.textContent='Camera blocked/unavailable'; return; }
-      videoEl.srcObject=stream; try{ await videoEl.play(); }catch{}
-      statusEl.textContent='Camera ready — choose Focus and press Start';
-      drawPreview();
+      pipVideo.srcObject=stream; try{ await pipVideo.play(); }catch{}
+      statusEl.textContent='Camera ready — frame your Base and press Base';
+      // ensure sizes once the first metadata is available
+      const tick=()=>{
+        if(ensureSizes()){
+          // show live preview into PIP only; composite canvas shows result
+          if(PREVIEW_SMOOTHING){ cctx.imageSmoothingEnabled=true; cctx.imageSmoothingQuality='high'; }
+          return; // size is set; stop loop
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
     })();
+
+    // Base capture (solid, 100%)
+    baseBtn.addEventListener('click', ()=>{
+      if(!W||!H){ statusEl.textContent='No frame yet — try again'; return; }
+      // grab current frame into frameCv
+      fctx.globalAlpha=1; fctx.globalCompositeOperation='source-over';
+      fctx.drawImage(pipVideo, 0,0,W,H);
+      drawBaseIntoComposite();
+      haveBase=true; baseBtn.disabled=true; startBtn.disabled=false;
+      statusEl.textContent='Base locked — press Start to record';
+    });
 
     // Start/Stop
     startBtn.addEventListener('click', async ()=>{
-      if(!stream) return;
+      if(!haveBase || !ready) return;
       if(!capturing){
-        if(!initCanvasSizes()) return;
-        if(!ready){ statusEl.textContent='Preparing…'; return; }
-
-        // AI mode?
-        aiKind = focusSel.value;
-        aiOn = (aiKind!=='motion');
-        if(aiOn){ await ensureModel(); startAIPoll(); }
-        else { if(aiTick){ clearInterval(aiTick); aiTick=null; worker?.postMessage({type:'setBoxes', boxes:[]}); } }
-
         capturing=true; startBtn.textContent='Stop'; startBtn.style.background='#b00000';
-        try{ cancelAnimationFrame(previewRAF); }catch{} previewRAF=null;
-
+        aiKind = focusSel.value; aiOn = (aiKind!=='diff');
+        if(aiOn){ await ensureModel(); }
+        startAIGate();
         const intervalMs = Math.max(10, parseInt(intSel.value||'200',10));
+
+        // start capture loop (camera stays ON, PIP shows it live)
         timer = setInterval(()=>{
-          const buf = grabFrameBuffer();
-          worker.postMessage({type:'add', buf}, [buf]); // transfer buffer
-          statusEl.textContent = aiOn ? `Stamping motion in AI box (${aiKind})…` : 'Stamping motion only…';
+          // draw latest frame → send to worker
+          fctx.globalAlpha=1; fctx.globalCompositeOperation='source-over';
+          fctx.drawImage(pipVideo, 0,0,W,H);
+          const buf = new Uint8ClampedArray(fctx.getImageData(0,0,W,H).data).buffer;
+          worker.postMessage({type:'add', buf}, [buf]);
+          statusEl.textContent = aiOn ? `Recording (AI ${aiKind} + BaseDiff)…` : 'Recording (BaseDiff)…';
         }, intervalMs);
-      } else {
+      }else{
         capturing=false; startBtn.textContent='Start'; startBtn.style.background='#e10000';
         if(timer){ clearInterval(timer); timer=null; }
-        if(aiTick){ clearInterval(aiTick); aiTick=null; }
+        if(aiTick){ clearInterval(aiTick); aiTick=null; worker?.postMessage({type:'setBoxes', boxes:[]}); }
         statusEl.textContent='Stopped — composite preserved';
       }
     });
 
-    // UI hooks
+    // UI
     resetBtn.addEventListener('click', resetAll);
     saveBtn.addEventListener('click', savePNG);
+    pipBtn.addEventListener('click', ()=>{ pipWrap.classList.toggle('hidden'); });
+
     focusSel.addEventListener('change', async ()=>{
-      if(focusSel.value==='motion'){ aiOn=false; if(aiTick){ clearInterval(aiTick); aiTick=null; } worker?.postMessage({type:'setBoxes', boxes:[]}); statusEl.textContent='Focus: Motion only'; }
-      else { aiKind=focusSel.value; aiOn=true; await ensureModel(); startAIPoll(); statusEl.textContent='Focus: AI '+aiKind; }
+      aiKind = focusSel.value; aiOn = (aiKind!=='diff');
+      if(aiOn){ await ensureModel(); }
+      startAIGate();
+      statusEl.textContent = aiOn ? `Focus: AI ${aiKind} + BaseDiff` : 'Focus: BaseDiff only';
     });
 
     // Cleanup
     window.addEventListener('beforeunload', ()=>{
-      try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
       try{ if(timer) clearInterval(timer); }catch{}
       try{ if(aiTick) clearInterval(aiTick); }catch{}
-      try{ if(stream){ const tracks=stream.getTracks?stream.getTracks():[]; tracks.forEach(t=>{ try{t.stop();}catch{} }); } }catch{}
+      try{
+        if(stream){
+          const tracks=stream.getTracks?stream.getTracks():[];
+          tracks.forEach(t=>{ try{ t.stop(); }catch{} });
+        }
+      }catch{}
       if(worker) worker.terminate();
     });
   </script>
