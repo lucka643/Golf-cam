@@ -1,164 +1,149 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Interval Camera (No Overlay)</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body{ margin:0; background:#000; color:#fff; font:14px/1.4 -apple-system,system-ui,Segoe UI,Roboto }
-  .bar{ position:fixed; left:12px; right:12px; top:12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center }
-  .pill{ background:#ffffff22; padding:6px 10px; border-radius:999px }
-  .stage{ position:fixed; inset:0; display:grid; place-items:center }
-  .frame{ position:relative; width:min(92vw,1100px); height:min(70vh,70vw); background:#000;
-          border:1px solid #ffffff33; border-radius:16px; overflow:hidden }
-  video,canvas{ position:absolute; inset:0; width:100%; height:100%; object-fit:contain }
-  .whiteout{ position:absolute; inset:0; background:rgba(255,255,255,.35); pointer-events:none; opacity:0; transition:opacity .2s }
-  .whiteout.show{ opacity:1 }
-  .controls{ position:fixed; left:12px; right:12px; bottom:16px; display:flex; justify-content:center; gap:32px; align-items:end }
-  .btn{ display:flex; flex-direction:column; align-items:center; gap:6px; opacity:1; transition:opacity .2s }
-  .btn[disabled]{ opacity:.4; pointer-events:none }
-  .dot{ border-radius:999px; transition:transform .12s }
-  .base{ width:80px; height:80px; background:#fff; border:2px solid #000 }
-  .start{ width:112px; height:112px; background:#e11; border:4px solid #fff }
-  .save{ width:64px; height:64px; border:2px solid #fff; display:grid; place-items:center }
-  .dot:active{ transform:scale(.95) }
-  .chips{ display:flex; gap:6px; align-items:center; flex-wrap:wrap }
-  .chip{ padding:6px 10px; border-radius:999px; border:1px solid #fff3; background:#ffffff22; cursor:pointer }
-  .chip.sel{ background:#fff; color:#000 }
-  .q{ margin-left:8px }
-</style>
-</head>
-<body>
-  <div class="bar">
-    <div id="status" class="pill">Enable Camera to begin</div>
-    <div id="count" class="pill" style="display:none"></div>
-    <button id="enable" class="chip">Enable Camera</button>
-    <div class="chips">
-      <span>Interval</span>
-      <button class="chip" data-int="0.05">0.05s</button>
-      <button class="chip sel" data-int="0.10">0.10s</button>
-      <button class="chip" data-int="0.20">0.20s</button>
-      <button class="chip" data-int="0.30">0.30s</button>
-      <button class="chip" data-int="0.40">0.40s</button>
-      <span class="q">Quality</span>
-      <button class="chip sel" data-dim="1280">1280p</button>
-      <button class="chip" data-dim="720">720p</button>
-      <button class="chip" data-dim="1920">1920p</button>
-    </div>
-  </div>
+// IntervalCamera (Canvas Preview) – React Web Prototype v12 (Fixed & Simplified)
+// Clean script: base-first UX, lock/fade, click animations, fade out buttons
+// Final result replaces live feed once done
 
-  <div class="stage">
-    <div class="frame">
-      <video id="v" playsinline muted></video>
-      <canvas id="c" aria-label="Composite"></canvas>
-      <div id="whiteout" class="whiteout"></div>
-    </div>
-  </div>
+import React, { useRef, useState } from "react";
 
-  <div class="controls">
-    <button id="baseBtn" class="btn" disabled>
-      <div class="dot base"></div><div>Base</div>
-    </button>
-    <button id="startBtn" class="btn" disabled>
-      <div class="dot start"></div><div>Start</div>
-    </button>
-    <a id="saveBtn" class="btn" download="composite.png">
-      <div class="dot save">⬇️</div><div>Save</div>
-    </a>
-  </div>
+export default function IntervalCamera() {
+  const videoRef = useRef(null);
+  const compositeRef = useRef(null);
+  const scratchRef = useRef(null);
+  const baseInputRef = useRef(null);
+  const burstInputRef = useRef(null);
 
-<script>
-(function(){
-  const v = document.getElementById('v');
-  const c = document.getElementById('c');
-  const ctx = c.getContext('2d');
-  const statusEl = document.getElementById('status');
-  const countEl = document.getElementById('count');
-  const whiteout = document.getElementById('whiteout');
-  const enableBtn = document.getElementById('enable');
-  const baseBtn = document.getElementById('baseBtn');
-  const startBtn = document.getElementById('startBtn');
-  const saveBtn = document.getElementById('saveBtn');
+  const [status, setStatus] = useState("Tap Base to begin");
+  const [baseClicked, setBaseClicked] = useState(false);
+  const [startClicked, setStartClicked] = useState(false);
+  const [pressBase, setPressBase] = useState(false);
+  const [pressStart, setPressStart] = useState(false);
+  const [overlayCount, setOverlayCount] = useState(0);
+  const [showResult, setShowResult] = useState(false);
 
-  const intChips = Array.from(document.querySelectorAll('.chip[data-int]'));
-  const dimChips = Array.from(document.querySelectorAll('.chip[data-dim]'));
-
-  let intervalSec = 0.10;
-  let maxDim = 1280; // longest side cap
-  let baseLocked = false;
-  let overlays = 0;
-  let timer = null;
-  const MAX_OVERLAYS = 30;
-
-  function selectChip(list, el){ list.forEach(b=>b.classList.remove('sel')); el.classList.add('sel'); }
-  function clampSize(srcW, srcH, maxSide){
-    const max = Math.max(srcW, srcH);
-    const s = max > maxSide ? maxSide / max : 1;
-    return { w: Math.max(1, Math.round(srcW*s)), h: Math.max(1, Math.round(srcH*s)) };
-  }
-  function ensureCanvasFromVideo(){
-    const vw = v.videoWidth|0, vh = v.videoHeight|0;
-    if (!vw || !vh) return false;
-    const { w, h } = clampSize(vw, vh, maxDim);
-    if (c.width !== w || c.height !== h){ c.width = w; c.height = h; }
-    return true;
+  function pressAnim(setter) {
+    setter(true);
+    setTimeout(() => setter(false), 140);
   }
 
-  intChips.forEach(b=> b.addEventListener('click', ()=>{ selectChip(intChips,b); intervalSec = parseFloat(b.dataset.int); }));
-  dimChips.forEach(b=> b.addEventListener('click', ()=>{ selectChip(dimChips,b); maxDim = parseInt(b.dataset.dim,10)||1280; if (v.srcObject) ensureCanvasFromVideo(); }));
+  function loadImageFromFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = reader.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
 
-  // Enable camera (top-level HTTPS required)
-  enableBtn.addEventListener('click', async ()=>{
-    enableBtn.disabled = true;
-    statusEl.textContent = 'Requesting camera…';
-    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){
-      statusEl.textContent = 'Camera API not available — must be a top-level HTTPS page (not an iframe)';
-      enableBtn.disabled = false; return;
+  async function onPickBase(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const img = await loadImageFromFile(file);
+    const c = compositeRef.current;
+    c.width = img.width;
+    c.height = img.height;
+    const ctx = c.getContext("2d");
+    ctx.globalAlpha = 1.0;
+    ctx.drawImage(img, 0, 0);
+    setBaseClicked(true);
+    setStatus("Base captured — now add photos");
+  }
+
+  async function onPickBurst(e) {
+    if (!baseClicked) return;
+    const files = Array.from(e.target.files);
+    const c = compositeRef.current;
+    const ctx = c.getContext("2d");
+    let count = 0;
+    for (const file of files) {
+      const img = await loadImageFromFile(file);
+      ctx.globalAlpha = 0.25;
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      count++;
+      setOverlayCount(count);
     }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio:false });
-      v.srcObject = stream; v.setAttribute('playsinline',''); v.muted = true;
-      await v.play();
-      statusEl.textContent = 'Tap Base to capture the base image';
-      baseBtn.disabled = false;
-    } catch (e) {
-      statusEl.textContent = (e && e.name === 'NotAllowedError')
-        ? 'Permission blocked. Ensure top-level HTTPS and allow camera for this site.'
-        : ('Camera failed: ' + (e && e.message ? e.message : e));
-      enableBtn.disabled = false;
-    }
-  });
+    setStartClicked(true);
+    setStatus("Done");
+    setShowResult(true);
+  }
 
-  baseBtn.addEventListener('click', ()=>{
-    if (baseLocked) return;
-    if (!ensureCanvasFromVideo()){ statusEl.textContent = 'No frame yet—try again'; return; }
-    try { ctx.globalAlpha = 1.0; ctx.globalCompositeOperation='source-over'; ctx.drawImage(v, 0, 0, c.width, c.height); } catch(_){}
-    baseLocked = true;
-    baseBtn.disabled = true;
-    startBtn.disabled = false;
-    whiteout.classList.add('show');
-    statusEl.textContent = 'Base set — choose interval and Start';
-  });
+  return (
+    <div className="w-full h-screen bg-black text-white relative flex items-center justify-center">
+      {/* Show composite result after capture */}
+      {showResult ? (
+        <canvas ref={compositeRef} className="absolute inset-0 w-full h-full object-contain" />
+      ) : (
+        <>
+          <video
+            ref={videoRef}
+            className="absolute inset-0 w-full h-full object-contain opacity-20"
+            muted
+            playsInline
+          />
+          <canvas ref={compositeRef} className="absolute top-3 right-3 w-[240px] h-[160px] border border-white/70 shadow-lg" />
+        </>
+      )}
 
-  startBtn.addEventListener('click', ()=>{
-    if (!baseLocked || timer) return;
-    startBtn.disabled = true; overlays = 0; countEl.style.display = 'inline-block';
-    statusEl.textContent = \`Capturing \${MAX_OVERLAYS} frames @ \${intervalSec.toFixed(2)}s…\`;
-    const tick = Math.max(10, Math.round(intervalSec * 1000));
-    timer = setInterval(()=>{
-      if (!ensureCanvasFromVideo()) return;
-      try { ctx.globalAlpha = 0.25; ctx.globalCompositeOperation='source-over'; ctx.drawImage(v,0,0,c.width,c.height); } catch(_){}
-      overlays++; countEl.textContent = overlays;
-      if (overlays >= MAX_OVERLAYS){
-        clearInterval(timer); timer = null;
-        statusEl.textContent = 'Done — showing composite';
-        try { saveBtn.href = c.toDataURL('image/png'); } catch(_){}
-      }
-    }, tick);
-  });
-})();
-</script>
-</body>
-</html>
+      {/* Status */}
+      <div className="absolute top-4 left-4 px-3 py-2 bg-white/10 rounded text-sm">
+        {status} {overlayCount > 0 && `— ${overlayCount}`}
+      </div>
+
+      {/* Controls */}
+      <div className="absolute bottom-8 left-0 right-0 flex justify-center gap-12">
+        {/* Base button */}
+        <button
+          onClick={() => baseInputRef.current.click()}
+          disabled={baseClicked}
+          className={`flex flex-col items-center gap-2 transition-opacity ${baseClicked ? "opacity-40" : "opacity-100"}`}
+        >
+          <div
+            className={`w-20 h-20 rounded-full border-2 border-black bg-white transform transition-transform ${
+              pressBase ? "scale-95" : "scale-100"
+            }`}
+            onMouseDown={() => pressAnim(setPressBase)}
+          />
+          <span>Base</span>
+        </button>
+
+        {/* Start button */}
+        <button
+          onClick={() => burstInputRef.current.click()}
+          disabled={!baseClicked || startClicked}
+          className={`flex flex-col items-center gap-2 transition-opacity ${
+            !baseClicked || startClicked ? "opacity-40" : "opacity-100"
+          }`}
+        >
+          <div
+            className={`w-28 h-28 rounded-full border-4 border-white bg-red-600 transform transition-transform ${
+              pressStart ? "scale-95" : "scale-100"
+            }`}
+            onMouseDown={() => pressAnim(setPressStart)}
+          />
+          <span>Start</span>
+        </button>
+      </div>
+
+      {/* Inputs */}
+      <input
+        ref={baseInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={onPickBase}
+      />
+      <input
+        ref={burstInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={onPickBurst}
+      />
+    </div>
+  );
+}
