@@ -57,7 +57,6 @@
     const intSel = document.getElementById("interval");
 
     let hasBase = false;
-    let baseImageData = null;
 
     // Use back camera when available
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
@@ -89,7 +88,6 @@
       const ctx = feedBox.getContext("2d");
       ctx.globalAlpha = 1.0; // base solid
       ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
-      baseImageData = ctx.getImageData(0, 0, feedBox.width, feedBox.height);
       hasBase = true;
       baseBtn.disabled = true;
       startBtn.disabled = false;
@@ -97,7 +95,7 @@
     };
 
     startBtn.onclick = () => {
-      if (!hasBase || !baseImageData) return;
+      if (!hasBase) return;
       startBtn.disabled = true;
       const ctx = feedBox.getContext("2d");
       const interval = parseInt(intSel.value);
@@ -105,13 +103,9 @@
       setInterval(() => {
         const s = grabFrame();
         if (!s) return;
-        // Draw base permanently
-        ctx.putImageData(baseImageData, 0, 0);
-        // Then stack every previous overlay plus the new one
+        // Each frame is permanently stamped at 75% transparency
         ctx.globalAlpha = 0.75;
         ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
-        // Update baseImageData to include this new blended frame permanently
-        baseImageData = ctx.getImageData(0, 0, feedBox.width, feedBox.height);
       }, interval);
       statusEl.textContent = "Recording overlays…";
     };
