@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Interval Camera (Centered Feed)</title>
+  <title>Interval Camera (Base Solid)</title>
   <style>
     body { margin:0; background:black; color:white; font-family:sans-serif; }
     #status { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.1); padding:6px; border-radius:6px; }
@@ -45,8 +45,8 @@
       </label>
       <label>Transparency: 
         <select id="alpha">
-          <option value="0.5" selected>50%</option>
-          <option value="0.25">25%</option>
+          <option value="0.75" selected>75%</option>
+          <option value="0.5">50%</option>
         </select>
       </label>
     </div>
@@ -64,7 +64,6 @@
     const alphaSel = document.getElementById("alpha");
 
     let hasBase = false;
-    let overlays = 0;
 
     // Use back camera when available
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
@@ -109,7 +108,7 @@
       feedBox.width = Math.round(s.width * scale);
       feedBox.height = Math.round(s.height * scale);
       const ctx = feedBox.getContext("2d");
-      ctx.globalAlpha = 1.0;
+      ctx.globalAlpha = 1.0; // base image solid
       ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
       hasBase = true;
       baseBtn.disabled = true;
@@ -120,22 +119,16 @@
     startBtn.onclick = () => {
       if (!hasBase) return;
       startBtn.disabled = true;
-      overlays = 0;
       const ctx = feedBox.getContext("2d");
       const interval = parseInt(intSel.value);
       const alpha = parseFloat(alphaSel.value);
-      const timer = setInterval(() => {
+      setInterval(() => {
         const s = grabFrame();
         if (!s) return;
-        ctx.globalAlpha = alpha;
+        ctx.globalAlpha = alpha; // overlays at chosen transparency
         ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
-        overlays++;
-        statusEl.textContent = "Capturing — " + overlays;
-        if (overlays >= 10) {
-          clearInterval(timer);
-          statusEl.textContent = "Done!";
-        }
       }, interval);
+      statusEl.textContent = "Recording…";
     };
   </script>
 </body>
