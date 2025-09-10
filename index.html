@@ -2,127 +2,284 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Permanent Overlay Camera</title>
+  <title>Golf Swing Overlay Camera</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { margin:0; background:black; color:white; font-family:sans-serif; }
-    #status { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.1); padding:6px; border-radius:6px; }
-    #controls { position:absolute; bottom:20px; left:0; right:0; display:flex; flex-direction:column; align-items:center; gap:10px; }
-    .row { display:flex; gap:20px; justify-content:center; }
-    button { cursor:pointer; font-size:16px; }
-    #baseBtn { width:80px; height:80px; border-radius:50%; background:white; border:2px solid black; }
-    #startBtn { width:100px; height:100px; border-radius:50%; background:red; border:3px solid white; color:white; }
-    select { font-size:14px; padding:4px; border-radius:6px; }
-    #feedBox { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:80%; max-width:800px; aspect-ratio:4/3; border:2px solid white; background:black; }
-    #video { display:none; }
+    :root { --edge: 80vw; }
+    body { margin:0; background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #status {
+      position: absolute; top: 12px; left: 12px;
+      background: rgba(255,255,255,0.08); padding: 6px 10px; border-radius: 8px;
+      font-size: 14px;
+    }
+    #feedWrap {
+      position: absolute; inset: 0; display: grid; place-items: center;
+    }
+    #feedCanvas {
+      width: min(80vw, 1000px);
+      aspect-ratio: 4 / 3;
+      border: 2px solid #fff; background:#000;
+      display: block;
+    }
+    #videoEl { display:none; } /* video element is hidden; we draw into canvas */
+    #controls {
+      position: absolute; left: 0; right: 0; bottom: 18px;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+    }
+    .row { display:flex; gap: 18px; flex-wrap: wrap; justify-content:center; }
+    button { cursor: pointer; font-size: 16px; }
+    #baseBtn {
+      width: 86px; height: 86px; border-radius: 50%;
+      background: #fff; color:#000; border: 2px solid #000;
+      font-weight: 600;
+    }
+    #startBtn {
+      width: 110px; height: 110px; border-radius: 50%;
+      background: #e10000; color: #fff; border: 4px solid #fff;
+      font-weight: 700;
+    }
+    #startBtn[disabled], #baseBtn[disabled] { opacity: 0.45; cursor: default; }
+    select {
+      appearance:none; -webkit-appearance:none; -moz-appearance:none;
+      background:#111; color:#fff; border:1px solid #555; border-radius:8px;
+      padding: 8px 10px; font-size: 14px; min-width: 130px;
+    }
+    label { font-size: 14px; color:#ddd; display:flex; align-items:center; gap:8px; }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="feedBox"></canvas>
-  <canvas id="scratch" style="display:none;"></canvas>
+  <!-- Hidden live video source -->
+  <video id="videoEl" autoplay playsinline muted></video>
 
+  <!-- Centered canvas that shows live preview (before base), then the base, then permanent overlays -->
+  <div id="feedWrap">
+    <canvas id="feedCanvas"></canvas>
+  </div>
+
+  <!-- Status -->
   <div id="status">Loading…</div>
+
+  <!-- Controls -->
   <div id="controls">
     <div class="row">
       <button id="baseBtn">Base</button>
       <button id="startBtn" disabled>Start</button>
     </div>
     <div class="row">
-      <label>Resolution: 
+      <label>
+        Resolution
         <select id="resolution">
+          <!-- value = target max dimension of the longer side -->
           <option value="640">640p</option>
           <option value="1280" selected>1280p</option>
           <option value="1920">1920p</option>
         </select>
       </label>
-      <label>Interval: 
+      <label>
+        Interval
         <select id="interval">
-          <option value="100">0.1s</option>
-          <option value="200" selected>0.2s</option>
-          <option value="500">0.5s</option>
-          <option value="1000">1s</option>
+          <option value="50">0.05s</option>
+          <option value="100">0.10s</option>
+          <option value="200" selected>0.20s</option>
+          <option value="300">0.30s</option>
+          <option value="400">0.40s</option>
+          <option value="500">0.50s</option>
+          <option value="1000">1.00s</option>
+        </select>
+      </label>
+      <label>
+        Overlay Opacity
+        <select id="overlayAlpha">
+          <option value="0.75" selected>75%</option>
+          <option value="0.50">50%</option>
+          <option value="0.25">25%</option>
         </select>
       </label>
     </div>
   </div>
 
   <script>
-    const video = document.getElementById("video");
-    const feedBox = document.getElementById("feedBox");
-    const scratch = document.getElementById("scratch");
-    const statusEl = document.getElementById("status");
-    const baseBtn = document.getElementById("baseBtn");
-    const startBtn = document.getElementById("startBtn");
-    const resSel = document.getElementById("resolution");
-    const intSel = document.getElementById("interval");
+    // Elements
+    const videoEl = document.getElementById('videoEl');
+    const feedCanvas = document.getElementById('feedCanvas');
+    const statusEl = document.getElementById('status');
+    const baseBtn = document.getElementById('baseBtn');
+    const startBtn = document.getElementById('startBtn');
+    const resSel = document.getElementById('resolution');
+    const intSel = document.getElementById('interval');
+    const alphaSel = document.getElementById('overlayAlpha');
 
-    let hasBase = false;
-    let recording = false;
-    let timer = null;
+    // Scratch for grabbing frames safely
+    const scratch = document.createElement('canvas');
+    const sctx = scratch.getContext('2d', { willReadFrequently: false });
 
-    // Use back camera when available
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
-      .then(stream => {
-        video.srcObject = stream;
-        video.play();
-        statusEl.textContent = "Camera ready — tap Base";
-      })
-      .catch(() => {
-        statusEl.textContent = "Camera blocked — still usable";
-      });
+    // State
+    let haveBase = false;        // true once base snapshot locked
+    let previewRAF = null;       // requestAnimationFrame id for live preview
+    let recordTimer = null;      // setInterval id for overlay capture
+    let recording = false;       // is capturing overlays
+    let stream = null;           // media stream
 
-    function grabFrame() {
-      if (!video.videoWidth) return null;
-      scratch.width = video.videoWidth;
-      scratch.height = video.videoHeight;
-      const ctx = scratch.getContext("2d");
-      ctx.drawImage(video, 0, 0);
-      return scratch;
+    // --- Camera setup (prefer rear camera; fallback gracefully) ---
+    (async function initCamera() {
+      statusEl.textContent = 'Requesting camera…';
+      const attempts = [
+        { video: { facingMode: { exact: 'environment' } }, audio: false },
+        { video: { facingMode: { ideal: 'environment' } }, audio: false },
+        { video: { facingMode: { ideal: 'user' } }, audio: false },
+        { video: true, audio: false }
+      ];
+
+      let lastErr;
+      for (const c of attempts) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(c);
+          break;
+        } catch (e) { lastErr = e; }
+      }
+
+      if (!stream) {
+        statusEl.textContent = 'Camera blocked/unavailable';
+        return;
+      }
+
+      videoEl.srcObject = stream;
+      try { await videoEl.play(); } catch {}
+      statusEl.textContent = 'Camera ready — take Base when framed';
+
+      // Kick off live preview into the canvas until Base is taken
+      startPreviewLoop();
+    })();
+
+    function startPreviewLoop() {
+      cancelAnimationFrame(previewRAF);
+      const ctx = feedCanvas.getContext('2d');
+
+      const tick = () => {
+        if (haveBase) return; // stop drawing once base is taken
+        const vw = videoEl.videoWidth || 0;
+        const vh = videoEl.videoHeight || 0;
+        if (vw && vh) {
+          // Set canvas pixel size to chosen resolution (keeps sharp output)
+          const targetMax = parseInt(resSel.value, 10);
+          const scale = targetMax / Math.max(vw, vh);
+          const cw = Math.max(1, Math.round(vw * scale));
+          const ch = Math.max(1, Math.round(vh * scale));
+          if (feedCanvas.width !== cw || feedCanvas.height !== ch) {
+            feedCanvas.width = cw; feedCanvas.height = ch;
+          }
+          // Draw current video frame to canvas (preview only)
+          ctx.globalAlpha = 1.0;
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.drawImage(videoEl, 0, 0, feedCanvas.width, feedCanvas.height);
+        }
+        previewRAF = requestAnimationFrame(tick);
+      };
+      previewRAF = requestAnimationFrame(tick);
     }
 
-    baseBtn.onclick = () => {
-      const s = grabFrame();
-      if (!s) return;
-      const target = parseInt(resSel.value);
-      const scale = target / Math.max(s.width, s.height);
-      feedBox.width = Math.round(s.width * scale);
-      feedBox.height = Math.round(s.height * scale);
-      const ctx = feedBox.getContext("2d");
-      ctx.clearRect(0, 0, feedBox.width, feedBox.height);
-      ctx.globalAlpha = 1.0; // base solid
-      ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
-      hasBase = true;
+    function grabFrameToScratch() {
+      const vw = videoEl.videoWidth || 0;
+      const vh = videoEl.videoHeight || 0;
+      if (!vw || !vh) return false;
+      // Match scratch to video pixels
+      if (scratch.width !== vw || scratch.height !== vh) {
+        scratch.width = vw; scratch.height = vh;
+      }
+      sctx.globalAlpha = 1.0;
+      sctx.globalCompositeOperation = 'source-over';
+      sctx.drawImage(videoEl, 0, 0, vw, vh);
+      return true;
+    }
+
+    function drawScaled(srcCanvas, destCtx, dw, dh, alpha) {
+      if (!srcCanvas || !destCtx) return;
+      destCtx.globalAlpha = alpha;
+      destCtx.globalCompositeOperation = 'source-over';
+      destCtx.drawImage(srcCanvas, 0, 0, srcCanvas.width, srcCanvas.height, 0, 0, dw, dh);
+    }
+
+    // --- Base capture: draw once at 100% and stop preview loop ---
+    baseBtn.addEventListener('click', () => {
+      if (haveBase) return;
+      if (!grabFrameToScratch()) { statusEl.textContent = 'No frame yet — try again'; return; }
+
+      // Fix canvas pixel size to chosen resolution based on the *current* frame dimensions
+      const vw = scratch.width, vh = scratch.height;
+      const targetMax = parseInt(resSel.value, 10);
+      const scale = targetMax / Math.max(vw, vh);
+      const cw = Math.max(1, Math.round(vw * scale));
+      const ch = Math.max(1, Math.round(vh * scale));
+      feedCanvas.width = cw; feedCanvas.height = ch;
+
+      const ctx = feedCanvas.getContext('2d');
+      ctx.clearRect(0, 0, cw, ch);
+      drawScaled(scratch, ctx, cw, ch, 1.0); // base = solid
+
+      haveBase = true;
       baseBtn.disabled = true;
       startBtn.disabled = false;
-      statusEl.textContent = "Base snapshot taken — press Start";
-    };
+      statusEl.textContent = 'Base locked — press Start to overlay';
 
-    startBtn.onclick = () => {
-      if (!hasBase) return;
+      // Stop preview to ensure nothing ever redraws over the base
+      cancelAnimationFrame(previewRAF);
+      previewRAF = null;
+    });
+
+    // --- Start/Stop overlay capture: additive stamping (no clears, no base redraw) ---
+    startBtn.addEventListener('click', () => {
+      if (!haveBase) return;
+
       if (!recording) {
-        // Start recording
+        // START
         recording = true;
-        startBtn.textContent = "Stop";
-        const ctx = feedBox.getContext("2d");
-        const interval = parseInt(intSel.value);
+        startBtn.textContent = 'Stop';
+        startBtn.style.background = '#b00000';
+        const ctx = feedCanvas.getContext('2d');
+        const alpha = parseFloat(alphaSel.value || '0.75');
+        const intervalMs = Math.max(10, parseInt(intSel.value || '200', 10));
 
-        timer = setInterval(() => {
-          const s = grabFrame();
-          if (!s) return;
-          // Stamp each frame permanently at 75% transparency
-          ctx.globalAlpha = 0.75;
-          ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
-        }, interval);
+        // Safety: ensure composite mode and do NOT clear or redraw base
+        ctx.globalCompositeOperation = 'source-over';
 
-        statusEl.textContent = "Recording overlays…";
+        recordTimer = setInterval(() => {
+          // Grab the current video frame into the scratch canvas
+          if (!grabFrameToScratch()) return;
+
+          // Stamp permanently into the main canvas at chosen opacity
+          drawScaled(scratch, ctx, feedCanvas.width, feedCanvas.height, alpha);
+          // NOTE: we NEVER call clearRect or redraw base here.
+          // Each call simply adds the new frame to what’s already there.
+        }, intervalMs);
+
+        statusEl.textContent = `Recording @ ${(intervalMs/1000).toFixed(2)}s — overlays are permanent`;
+
       } else {
-        // Stop recording
+        // STOP
         recording = false;
-        clearInterval(timer);
-        startBtn.textContent = "Start";
-        statusEl.textContent = "Recording stopped";
+        startBtn.textContent = 'Start';
+        startBtn.style.background = '#e10000';
+        if (recordTimer) { clearInterval(recordTimer); recordTimer = null; }
+        statusEl.textContent = 'Recording stopped — composite preserved';
       }
-    };
+    });
+
+    // Handle resolution changes BEFORE base is taken (so preview canvas follows)
+    resSel.addEventListener('change', () => {
+      if (!haveBase) { startPreviewLoop(); }
+    });
+
+    // Clean up when leaving the page
+    window.addEventListener('beforeunload', () => {
+      try { if (previewRAF) cancelAnimationFrame(previewRAF); } catch {}
+      try { if (recordTimer) clearInterval(recordTimer); } catch {}
+      try {
+        if (stream) {
+          const tracks = stream.getTracks ? stream.getTracks() : [];
+          tracks.forEach(t => { try { t.stop(); } catch {} });
+        }
+      } catch {}
+    });
   </script>
 </body>
 </html>
