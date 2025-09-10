@@ -2,18 +2,20 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Composite — Write-Once (Stabler, No Flash/Particles)</title>
+  <title>Golf Swing Composite — v2.1</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { margin:0; background:#000; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
-    #status { position:absolute; top:12px; left:12px; background:rgba(255,255,255,0.08); padding:6px 10px; border-radius:8px; font-size:14px; }
-    #feedWrap { position:absolute; inset:0; display:grid; place-items:center; }
-    #feedCanvas { width:min(80vw,1000px); aspect-ratio:4/3; border:2px solid #fff; background:#000; display:block; }
-    #videoEl { display:none; } /* we only draw into canvas */
-    #controls { position:absolute; left:0; right:0; bottom:18px; display:flex; flex-direction:column; align-items:center; gap:10px; }
-    .row { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
+    :root { --box-w: min(80vw, 1000px); }
+    body { margin:0; background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #version { position: absolute; top: 12px; right: 12px; opacity: .8; font: 600 12px/1 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+    #status  { position: absolute; top: 12px; left: 12px; background: rgba(255,255,255,.08); padding: 6px 10px; border-radius: 8px; font-size: 14px; }
+    #feedWrap { position: absolute; inset: 0; display: grid; place-items: center; }
+    #feedCanvas { width: var(--box-w); aspect-ratio: 4 / 3; border: 2px solid #fff; background: #000; display: block; }
+    #videoEl { display: none; }
+    #controls { position: absolute; left: 0; right: 0; bottom: 18px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+    .row { display:flex; gap:18px; flex-wrap: wrap; justify-content:center; }
     button { cursor:pointer; font-size:16px; }
-    #baseBtn { width:86px; height:86px; border-radius:50%; background:#fff; color:#000; border:2px solid #000; font-weight:600; }
+    #baseBtn  { width:86px; height:86px; border-radius:50%; background:#fff; color:#000; border:2px solid #000; font-weight:600; }
     #startBtn { width:110px; height:110px; border-radius:50%; background:#e10000; color:#fff; border:4px solid #fff; font-weight:700; }
     #startBtn[disabled], #baseBtn[disabled] { opacity:.45; cursor:default; }
     label { font-size:14px; color:#ddd; display:flex; align-items:center; gap:8px; }
@@ -21,11 +23,16 @@
   </style>
 </head>
 <body>
-  <video id="videoEl" autoplay playsinline muted></video>
-
-  <div id="feedWrap"><canvas id="feedCanvas"></canvas></div>
+  <div id="version">v2.1</div>
   <div id="status">Loading…</div>
 
+  <!-- Hidden camera source -->
+  <video id="videoEl" autoplay playsinline muted></video>
+
+  <!-- Centered canvas: live (pre-base), then base, then permanent overlays -->
+  <div id="feedWrap"><canvas id="feedCanvas"></canvas></div>
+
+  <!-- Controls -->
   <div id="controls">
     <div class="row">
       <button id="baseBtn">Base</button>
@@ -36,8 +43,8 @@
         Interval
         <select id="interval">
           <option value="50">0.05s</option>
-          <option value="100" selected>0.10s</option>
-          <option value="200">0.20s</option>
+          <option value="100">0.10s</option>
+          <option value="200" selected>0.20s</option>
           <option value="300">0.30s</option>
           <option value="400">0.40s</option>
           <option value="500">0.50s</option>
@@ -48,7 +55,20 @@
   </div>
 
   <script>
-    // --- Elements ---
+    /* =========================
+       Tunables (picked for look)
+       ========================= */
+    const OVERLAY_ALPHA    = 0.70;   // each new pose visibility
+    const DIFF_THRESH      = 22;     // luma diff sensitivity (higher = less sensitive)
+    const CONFIRM_FRAMES   = 3;      // must be motion in N consecutive ticks
+    const DILATE_ITERS     = 1;      // morphology: fill tiny holes
+    const ERODE_ITERS      = 0;      // then optionally tighten
+    const MIN_COMMIT_RATIO = 0.002;  // min moving pixels (ratio of total) to stamp
+    const MIN_COMMIT_GAP   = 120;    // ms between commits (global gate)
+
+    /* =========================
+       Elements / state
+       ========================= */
     const videoEl     = document.getElementById('videoEl');
     const feedCanvas  = document.getElementById('feedCanvas');
     const statusEl    = document.getElementById('status');
@@ -56,72 +76,49 @@
     const startBtn    = document.getElementById('startBtn');
     const intSel      = document.getElementById('interval');
 
-    // Offscreen (same size as feedCanvas)
-    const scratch     = document.createElement('canvas');
-    const sctx        = scratch.getContext('2d', { willReadFrequently:true });
+    const scratch = document.createElement('canvas');
+    const sctx    = scratch.getContext('2d', { willReadFrequently:true });
+    const cctx    = feedCanvas.getContext('2d', { willReadFrequently:true });
 
-    // State
     let stream=null, previewRAF=null, haveBase=false, recording=false, recordTimer=null;
 
-    // Composite buffer (what user sees)
-    let compositeImage=null, comp=null;             // ImageData + Uint8 view
-    let writtenMap=null;                            // Uint8Array: 1 if pixel was already written by motion
+    let compositeImage=null, comp=null; // ImageData + Uint8 view (what you see)
+    let writtenMap=null;                // Uint8: 1 if pixel already stamped by motion
+    let baseImage=null, base=null;      // stored base at canvas size
+    let hot=null;                       // temporal hit counters per pixel
+    let lastCommitTs = 0;
 
-    // Base buffer (for motion detection)
-    let baseImage=null, base=null;                  // ImageData + Uint8 view
-
-    // Temporal hotness counters for de-noise (avoid flicker/particles)
-    let hot=null;                                   // Uint8Array per-pixel counter
-
-    // Settings chosen for stability/clarity:
-    const OVERLAY_ALPHA = 0.65;     // balanced visibility without “overpowered” look
-    const CONFIRM_FRAMES = 2;       // require motion for N consecutive captures before committing
-    const DIFF_THRESH = 18;         // luminance threshold (0..255) – nudged lower = more sensitive
-    const DILATE_ITERS = 2;         // fill pinholes
-    const ERODE_ITERS  = 1;         // tighten edges after dilation
-
-    // Resolution: single target; try ~1080p long edge if available (otherwise 1280, else 640)
+    /* =========================
+       Utilities
+       ========================= */
     function pickTargetMax(vw, vh){ const m=Math.max(vw,vh); return m>=1920?1920:(m>=1280?1280:640); }
 
-    // Smoothing for nicer downscale
-    for (const ctx of [sctx]) {
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
+    function setCanvasSizeTo(targetMax){
+      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
+      const sc = targetMax / Math.max(vw, vh);
+      const cw = Math.max(1, Math.round(vw * sc));
+      const ch = Math.max(1, Math.round(vh * sc));
+      if (feedCanvas.width!==cw || feedCanvas.height!==ch) {
+        feedCanvas.width=cw; feedCanvas.height=ch;
+        scratch.width=cw; scratch.height=ch;
+      }
+      return {cw, ch};
     }
-    const cctx = feedCanvas.getContext('2d', { willReadFrequently:true });
-    cctx.imageSmoothingEnabled = true;
-    cctx.imageSmoothingQuality = 'high';
 
-    // --- Camera init (prefer rear) ---
-    (async function initCamera(){
-      statusEl.textContent='Requesting camera…';
-      const tries=[
-        {video:{facingMode:{exact:'environment'}},audio:false},
-        {video:{facingMode:{ideal:'environment'}},audio:false},
-        {video:{facingMode:{ideal:'user'}},audio:false},
-        {video:true,audio:false}
-      ];
-      for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); break; }catch{} }
-      if(!stream){ statusEl.textContent='Camera blocked/unavailable'; return; }
-      videoEl.srcObject=stream; try{ await videoEl.play(); }catch{}
-      statusEl.textContent='Camera ready — frame scene & press Base';
-      startPreviewLoop();
-    })();
+    function drawFrameToScratch(){
+      if(!scratch.width || !scratch.height) return false;
+      sctx.globalAlpha=1; sctx.globalCompositeOperation='source-over';
+      sctx.drawImage(videoEl,0,0,scratch.width,scratch.height);
+      return true;
+    }
 
     function startPreviewLoop(){
       cancelAnimationFrame(previewRAF);
       const tick=()=>{
         if(haveBase) return;
         const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
-        if(vw&&vh){
-          const target=pickTargetMax(vw,vh);
-          const sc=target/Math.max(vw,vh);
-          const cw=Math.max(1,Math.round(vw*sc));
-          const ch=Math.max(1,Math.round(vh*sc));
-          if(feedCanvas.width!==cw||feedCanvas.height!==ch){
-            feedCanvas.width=cw; feedCanvas.height=ch;
-            scratch.width=cw; scratch.height=ch;
-          }
+        if(vw && vh){
+          const {cw,ch}=setCanvasSizeTo(pickTargetMax(vw,vh));
           cctx.globalAlpha=1; cctx.globalCompositeOperation='source-over';
           cctx.drawImage(videoEl,0,0,cw,ch);
         }
@@ -130,44 +127,9 @@
       previewRAF=requestAnimationFrame(tick);
     }
 
-    function drawFrameToScratch(){
-      if(!scratch.width||!scratch.height) return false;
-      sctx.globalAlpha=1; sctx.globalCompositeOperation='source-over';
-      sctx.drawImage(videoEl,0,0,scratch.width,scratch.height);
-      return true;
-    }
-
-    // --- Base capture (solid, never redrawn) ---
-    baseBtn.addEventListener('click', ()=>{
-      if(haveBase) return;
-      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
-      if(!vw||!vh){ statusEl.textContent='No frame yet — try again'; return; }
-      const target=pickTargetMax(vw,vh), sc=target/Math.max(vw,vh);
-      const cw=Math.max(1,Math.round(vw*sc)), ch=Math.max(1,Math.round(vh*sc));
-      if(feedCanvas.width!==cw||feedCanvas.height!==ch){ feedCanvas.width=cw; feedCanvas.height=ch; scratch.width=cw; scratch.height=ch; }
-      if(!drawFrameToScratch()){ statusEl.textContent='No frame yet — try again'; return; }
-
-      // Base -> composite buffer
-      cctx.clearRect(0,0,cw,ch);
-      cctx.drawImage(scratch,0,0);
-      compositeImage=cctx.getImageData(0,0,cw,ch); comp=compositeImage.data;
-
-      // Save base separately for masking
-      baseImage=cctx.getImageData(0,0,cw,ch); base=baseImage.data;
-
-      // Maps
-      writtenMap=new Uint8Array(cw*ch); // 0/1 (not-written/written)
-      hot=new Uint8Array(cw*ch);        // consecutive motion counter
-
-      haveBase=true; baseBtn.disabled=true; startBtn.disabled=false;
-      statusEl.textContent='Base locked — press Start to record';
-      cancelAnimationFrame(previewRAF); previewRAF=null; // stop preview so base never changes
-    });
-
-    // --- Binary mask utilities (3x3) ---
-    function dilate3x3(src,W,H,iter=1){
+    function dilate3x3(src,W,H,it=1){
       let a=src, b=new Uint8Array(W*H);
-      for(let t=0;t<iter;t++){
+      for(let t=0;t<it;t++){
         b.fill(0);
         for(let y=1;y<H-1;y++){
           let i=y*W+1;
@@ -180,9 +142,9 @@
       }
       return a;
     }
-    function erode3x3(src,W,H,iter=1){
+    function erode3x3(src,W,H,it=1){
       let a=src, b=new Uint8Array(W*H);
-      for(let t=0;t<iter;t++){
+      for(let t=0;t<it;t++){
         b.fill(0);
         for(let y=1;y<H-1;y++){
           let i=y*W+1;
@@ -196,73 +158,134 @@
       return a;
     }
 
-    // --- Build stable motion mask with temporal confirmation + closing (dilate then erode) ---
     function buildStableMask(curr,W,H){
-      const rW=0.299, gW=0.587, bW=0.114;
-      const bin=new Uint8Array(W*H);
+      // per-pixel temporal confirmation on luma diff
+      const rW=.299, gW=.587, bW=.114;
+      const bin = new Uint8Array(W*H);
       for(let p=0,i=0;p<bin.length;p++,i+=4){
-        const y1=curr[i]*rW + curr[i+1]*gW + curr[i+2]*bW;
-        const y0=base[i]*rW + base[i+1]*gW + base[i+2]*bW;
-        const d=Math.abs(y1-y0);
-        // temporal confirmation
-        if(d>DIFF_THRESH){
-          if(hot[p]<255) hot[p]++;
-        }else{
-          hot[p]=0;
-        }
-        bin[p]=(hot[p]>=CONFIRM_FRAMES)?1:0;
+        const y1 = curr[i]*rW + curr[i+1]*gW + curr[i+2]*bW;
+        const y0 = base[i]*rW + base[i+1]*gW + base[i+2]*bW;
+        const d  = Math.abs(y1-y0);
+        if(d>DIFF_THRESH){ if(hot[p]<255) hot[p]++; } else { hot[p]=0; }
+        bin[p] = (hot[p] >= CONFIRM_FRAMES) ? 1 : 0;
       }
-      // morphological closing: dilate then erode to remove “particle” holes
-      const d1=dilate3x3(bin,W,H,DILATE_ITERS);
-      const e1=erode3x3(d1,W,H,ERODE_ITERS);
+      // small closing to remove “particle” holes
+      const d1 = dilate3x3(bin,W,H,DILATE_ITERS);
+      const e1 = (ERODE_ITERS>0) ? erode3x3(d1,W,H,ERODE_ITERS) : d1;
       return e1;
     }
 
-    // --- Start/Stop: write-once per pixel (no flashbang, no fading) ---
+    /* =========================
+       Camera init
+       ========================= */
+    (async function initCamera(){
+      statusEl.textContent='Requesting camera…';
+      const tries = [
+        { video:{ facingMode:{ exact:'environment' } }, audio:false },
+        { video:{ facingMode:{ ideal:'environment' } }, audio:false },
+        { video:{ facingMode:{ ideal:'user' } }, audio:false },
+        { video:true, audio:false }
+      ];
+      let ok=false;
+      for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); ok=true; break; } catch{} }
+      if(!ok){ statusEl.textContent='Camera blocked/unavailable'; return; }
+      videoEl.srcObject=stream; try{ await videoEl.play(); }catch{}
+      statusEl.textContent='Camera ready — frame your scene and press Base';
+      startPreviewLoop();
+    })();
+
+    /* =========================
+       Base capture (solid 100%)
+       ========================= */
+    baseBtn.addEventListener('click', ()=>{
+      if(haveBase) return;
+      const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
+      if(!vw||!vh){ statusEl.textContent='No frame yet — try again'; return; }
+      const {cw,ch} = setCanvasSizeTo(pickTargetMax(vw,vh));
+      if(!drawFrameToScratch()){ statusEl.textContent='No frame yet — try again'; return; }
+
+      // draw base once into composite buffer
+      cctx.clearRect(0,0,cw,ch);
+      cctx.drawImage(scratch,0,0);
+      compositeImage = cctx.getImageData(0,0,cw,ch);
+      comp           = compositeImage.data;
+
+      // store base for masking
+      baseImage = cctx.getImageData(0,0,cw,ch);
+      base      = baseImage.data;
+
+      writtenMap = new Uint8Array(cw*ch);
+      hot        = new Uint8Array(cw*ch);
+
+      haveBase = true; baseBtn.disabled=true; startBtn.disabled=false;
+      statusEl.textContent='Base locked — press Start to record';
+      cancelAnimationFrame(previewRAF); previewRAF=null; // stop live overwrite
+    });
+
+    /* =========================
+       Start/Stop (write-once pixels)
+       ========================= */
     startBtn.addEventListener('click', ()=>{
       if(!haveBase) return;
 
       if(!recording){
         // START
-        recording=true; startBtn.textContent='Stop'; startBtn.style.background='#b00000';
-        const intervalMs=Math.max(10, parseInt(intSel.value||'100',10));
-        const W=feedCanvas.width, H=feedCanvas.height;
+        recording = true;
+        startBtn.textContent='Stop';
+        startBtn.style.background='#b00000';
 
-        recordTimer=setInterval(()=>{
+        const intervalMs = Math.max(10, parseInt(intSel.value||'200',10));
+        const W=feedCanvas.width, H=feedCanvas.height;
+        const minCommitPixels = Math.max(50, Math.floor(W*H*MIN_COMMIT_RATIO)); // dynamic gate
+
+        recordTimer = setInterval(()=>{
           if(!drawFrameToScratch()) return;
 
-          const frame=sctx.getImageData(0,0,W,H);
-          const fd=frame.data;
+          // get current frame pixels
+          const frame = sctx.getImageData(0,0,W,H);
+          const fd    = frame.data;
 
-          // Build stable motion mask
-          const mask=buildStableMask(fd,W,H);
+          // build stable motion mask
+          const mask = buildStableMask(fd,W,H);
 
-          // First-write-wins (blend once against existing composite)
-          const a=OVERLAY_ALPHA, ia=1-a;
+          // count candidates and skip if too small or too soon
+          let candidates = 0;
+          for(let p=0;p<mask.length;p++) if(mask[p]===1 && writtenMap[p]===0) candidates++;
+          const now = performance.now();
+          if(candidates < minCommitPixels || (now - lastCommitTs) < MIN_COMMIT_GAP){
+            statusEl.textContent = 'Waiting for clear motion…';
+            return;
+          }
+          lastCommitTs = now;
+
+          // commit: first-write-wins blend vs existing composite
+          const a = OVERLAY_ALPHA, ia = 1-a;
           for(let p=0,i=0;p<mask.length;p++,i+=4){
             if(mask[p]===1 && writtenMap[p]===0){
               comp[i]   = (comp[i]  * ia + fd[i]   * a) | 0;
               comp[i+1] = (comp[i+1]* ia + fd[i+1] * a) | 0;
               comp[i+2] = (comp[i+2]* ia + fd[i+2] * a) | 0;
               comp[i+3] = 255;
-              writtenMap[p]=1; // lock pixel permanently
+              writtenMap[p]=1;
             }
           }
-
-          // Blit to screen
-          cctx.putImageData(compositeImage,0,0);
-          statusEl.textContent=`Recording @ ${(intervalMs/1000).toFixed(2)}s — write-once overlays`;
+          cctx.putImageData(compositeImage,0,0); // show updated composite
+          statusEl.textContent = `Stamped ${candidates} px @ ${(intervalMs/1000).toFixed(2)}s`;
         }, intervalMs);
 
-      }else{
+      } else {
         // STOP
-        recording=false; startBtn.textContent='Start'; startBtn.style.background='#e10000';
+        recording = false;
+        startBtn.textContent='Start';
+        startBtn.style.background='#e10000';
         if(recordTimer){ clearInterval(recordTimer); recordTimer=null; }
         statusEl.textContent='Recording stopped — composite preserved';
       }
     });
 
-    // Cleanup
+    /* =========================
+       Cleanup
+       ========================= */
     window.addEventListener('beforeunload', ()=>{
       try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
       try{ if(recordTimer) clearInterval(recordTimer); }catch{}
