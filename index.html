@@ -58,6 +58,7 @@
 
     let hasBase = false;
     let recording = false;
+    let timer = null;
 
     // Use back camera when available
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
@@ -98,21 +99,29 @@
 
     startBtn.onclick = () => {
       if (!hasBase) return;
-      startBtn.disabled = true;
-      recording = true;
-      const ctx = feedBox.getContext("2d");
-      const interval = parseInt(intSel.value);
+      if (!recording) {
+        // Start recording
+        recording = true;
+        startBtn.textContent = "Stop";
+        const ctx = feedBox.getContext("2d");
+        const interval = parseInt(intSel.value);
 
-      setInterval(() => {
-        if (!recording) return;
-        const s = grabFrame();
-        if (!s) return;
-        // Stamp each frame permanently at 75% transparency
-        ctx.globalAlpha = 0.75;
-        ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
-        statusEl.textContent = "Overlay stamped at " + new Date().toLocaleTimeString();
-      }, interval);
-      statusEl.textContent = "Recording overlays…";
+        timer = setInterval(() => {
+          const s = grabFrame();
+          if (!s) return;
+          // Stamp each frame permanently at 75% transparency
+          ctx.globalAlpha = 0.75;
+          ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
+        }, interval);
+
+        statusEl.textContent = "Recording overlays…";
+      } else {
+        // Stop recording
+        recording = false;
+        clearInterval(timer);
+        startBtn.textContent = "Start";
+        statusEl.textContent = "Recording stopped";
+      }
     };
   </script>
 </body>
