@@ -2,42 +2,74 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Interval Camera (Simple)</title>
+  <title>Interval Camera (iPad/iPhone)</title>
   <style>
     body { margin:0; background:black; color:white; font-family:sans-serif; }
     #status { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.1); padding:6px; border-radius:6px; }
-    #controls { position:absolute; bottom:30px; left:0; right:0; display:flex; justify-content:center; gap:60px; }
+    #controls { position:absolute; bottom:20px; left:0; right:0; display:flex; flex-direction:column; align-items:center; gap:10px; }
+    .row { display:flex; gap:20px; justify-content:center; }
     button { cursor:pointer; font-size:16px; }
     #baseBtn { width:80px; height:80px; border-radius:50%; background:white; border:2px solid black; }
     #startBtn { width:100px; height:100px; border-radius:50%; background:red; border:3px solid white; color:white; }
+    select { font-size:14px; padding:4px; border-radius:6px; }
+    #feedBox { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:60%; max-width:500px; aspect-ratio:4/3; border:2px solid white; background:black; }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline muted style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;"></video>
-  <canvas id="composite" style="position:absolute;top:10px;right:10px;width:240px;height:160px;border:1px solid white;"></canvas>
+  <video id="video" autoplay playsinline muted style="width:100%;height:100%;object-fit:contain;display:none;"></video>
+  <canvas id="feedBox"></canvas>
   <canvas id="scratch" style="display:none;"></canvas>
 
   <div id="status">Loading…</div>
   <div id="controls">
-    <button id="baseBtn">Base</button>
-    <button id="startBtn" disabled>Start</button>
+    <div class="row">
+      <button id="baseBtn">Base</button>
+      <button id="startBtn" disabled>Start</button>
+    </div>
+    <div class="row">
+      <label>Resolution: 
+        <select id="resolution">
+          <option value="640">640p</option>
+          <option value="1280" selected>1280p</option>
+          <option value="1920">1920p</option>
+        </select>
+      </label>
+      <label>Interval: 
+        <select id="interval">
+          <option value="100">0.1s</option>
+          <option value="200" selected>0.2s</option>
+          <option value="500">0.5s</option>
+          <option value="1000">1s</option>
+        </select>
+      </label>
+      <label>Transparency: 
+        <select id="alpha">
+          <option value="0.5" selected>50%</option>
+          <option value="0.25">25%</option>
+        </select>
+      </label>
+    </div>
   </div>
 
   <script>
     const video = document.getElementById("video");
-    const composite = document.getElementById("composite");
+    const feedBox = document.getElementById("feedBox");
     const scratch = document.getElementById("scratch");
     const statusEl = document.getElementById("status");
     const baseBtn = document.getElementById("baseBtn");
     const startBtn = document.getElementById("startBtn");
+    const resSel = document.getElementById("resolution");
+    const intSel = document.getElementById("interval");
+    const alphaSel = document.getElementById("alpha");
 
     let hasBase = false;
     let overlays = 0;
 
-    // Try to enable camera
-    navigator.mediaDevices.getUserMedia({ video: true })
+    // Use back camera when available
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
       .then(stream => {
         video.srcObject = stream;
+        video.style.display = "block";
         statusEl.textContent = "Camera ready — tap Base";
       })
       .catch(() => {
@@ -56,11 +88,13 @@
     baseBtn.onclick = () => {
       const s = grabFrame();
       if (!s) return;
-      composite.width = s.width;
-      composite.height = s.height;
-      const ctx = composite.getContext("2d");
+      const target = parseInt(resSel.value);
+      const scale = target / Math.max(s.width, s.height);
+      feedBox.width = Math.round(s.width * scale);
+      feedBox.height = Math.round(s.height * scale);
+      const ctx = feedBox.getContext("2d");
       ctx.globalAlpha = 1.0;
-      ctx.drawImage(s, 0, 0);
+      ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
       hasBase = true;
       baseBtn.disabled = true;
       startBtn.disabled = false;
@@ -71,22 +105,21 @@
       if (!hasBase) return;
       startBtn.disabled = true;
       overlays = 0;
-      const ctx = composite.getContext("2d");
+      const ctx = feedBox.getContext("2d");
+      const interval = parseInt(intSel.value);
+      const alpha = parseFloat(alphaSel.value);
       const timer = setInterval(() => {
         const s = grabFrame();
         if (!s) return;
-        ctx.globalAlpha = 0.25;
-        ctx.drawImage(s, 0, 0, composite.width, composite.height);
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(s, 0, 0, feedBox.width, feedBox.height);
         overlays++;
         statusEl.textContent = "Capturing — " + overlays;
         if (overlays >= 10) {
           clearInterval(timer);
           statusEl.textContent = "Done!";
-          composite.style.width = "100%";
-          composite.style.height = "100%";
-          video.style.opacity = 0;
         }
-      }, 200);
+      }, interval);
     };
   </script>
 </body>
