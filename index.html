@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Golf Swing Composite — v2.6 (Pixel-Checker, Worker)</title>
+  <title>Golf Swing Composite — v3.0 (AI/Motion Gated)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { --box-w: min(80vw, 1100px); }
@@ -22,7 +22,7 @@
   </style>
 </head>
 <body>
-  <div id="version">v2.6</div>
+  <div id="version">v3.0</div>
   <div id="status">Loading…</div>
 
   <!-- Hidden camera -->
@@ -50,21 +50,33 @@
           <option value="1000">1.00s</option>
         </select>
       </label>
+      <label>Focus
+        <select id="focus">
+          <option value="motion" selected>Motion (fast)</option>
+          <option value="person">AI: Person</option>
+          <option value="ball">AI: Sports ball</option>
+        </select>
+      </label>
     </div>
   </div>
 
-  <script>
-    /* ===== Fast pixel-checker mixer (no base) =====
-       Each pixel position is assigned to a frame using a fixed random
-       permutation P and rule: frame = P[pixel] % F, where F = #frames.
-       That gives an (almost) equal share per frame, at **near-pixel size**.
-       Mixing happens in a Web Worker, so the UI stays smooth.            */
+  <!-- Optional TensorFlow.js + COCO-SSD (loaded only if AI focus chosen) -->
+  <script id="tfjs" defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js" onerror="this.dataset.fail=1" ></script>
+  <script id="cocossd" defer src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js" onerror="this.dataset.fail=1"></script>
 
-    // ---- Tunables ----
-    const TARGET_LONG_EDGE = 1280; // good speed/quality on iPad; raise to 1920 if you want
+  <script>
+    /* =============================
+       v3.0 — AI/Motion Gated Mixer
+       =============================
+       - Worker maintains: background model, motion mask, write-once composite.
+       - Main thread: camera, UI, (optional) AI boxes for person/ball.
+    */
+
+    // Tunables (picked for stability/speed)
+    const TARGET_LONG_EDGE = 1280;   // raise to 1920 for more detail (slower)
     const PREVIEW_SMOOTHING = true;
 
-    // ---- Elements ----
+    // Elements
     const videoEl    = document.getElementById('videoEl');
     const feedCanvas = document.getElementById('feedCanvas');
     const cctx       = feedCanvas.getContext('2d', { willReadFrequently:true });
@@ -73,37 +85,36 @@
     const resetBtn   = document.getElementById('resetBtn');
     const saveBtn    = document.getElementById('saveBtn');
     const intSel     = document.getElementById('interval');
+    const focusSel   = document.getElementById('focus');
 
-    // Offscreen capture canvas
     const frameCanvas = document.createElement('canvas');
     const fctx        = frameCanvas.getContext('2d', { willReadFrequently:true });
 
     // State
     let stream=null, previewRAF=null, capturing=false, timer=null;
     let W=0, H=0;
-    let worker=null;    // Web Worker that holds frames + composes
-    let ready=false;    // worker ready with permutation
+    let worker=null, ready=false;
+    let model=null, aiOn=false, aiKind='motion', aiTick=null;
 
-    // ---- Helpers ----
-    function pickTargetMax(vw, vh){
+    // Helpers
+    function pickTargetMax(vw,vh){
       const m=Math.max(vw,vh);
       if (TARGET_LONG_EDGE <= m) return TARGET_LONG_EDGE;
-      if (m >= 1920) return 1920;
-      if (m >= 1280) return 1280;
+      if (m>=1920) return 1920;
+      if (m>=1280) return 1280;
       return 640;
     }
     function initCanvasSizes(){
       const vw=videoEl.videoWidth|0, vh=videoEl.videoHeight|0;
       if(!vw||!vh) return false;
       const target = pickTargetMax(vw,vh);
-      const sc = target / Math.max(vw,vh);
+      const sc = target/Math.max(vw,vh);
       const cw = Math.max(1, Math.round(vw*sc));
       const ch = Math.max(1, Math.round(vh*sc));
       if (feedCanvas.width!==cw || feedCanvas.height!==ch){
         feedCanvas.width=cw; feedCanvas.height=ch;
         frameCanvas.width=cw; frameCanvas.height=ch;
         W=cw; H=ch;
-        // (Re)start worker with the new size
         initWorker(W,H);
       }
       return true;
@@ -122,18 +133,16 @@
       };
       previewRAF=requestAnimationFrame(tick);
     }
-    function grabFrameToBuffer(){
-      fctx.globalAlpha=1;
-      fctx.globalCompositeOperation='source-over';
+    function grabFrameBuffer(){
+      fctx.globalAlpha=1; fctx.globalCompositeOperation='source-over';
       fctx.drawImage(videoEl,0,0,W,H);
       const img = fctx.getImageData(0,0,W,H);
-      // copy to a fresh buffer and transfer to worker (zero-copy via transferables)
-      const copy = new Uint8ClampedArray(img.data); // copy once; avoids locking canvas buffer
-      return copy.buffer;
+      return new Uint8ClampedArray(img.data).buffer;
     }
     function resetAll(){
       try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
       try{ if(timer) clearInterval(timer); }catch{}
+      if(aiTick){ clearInterval(aiTick); aiTick=null; }
       previewRAF=null; timer=null; capturing=false;
       cctx.clearRect(0,0,feedCanvas.width,feedCanvas.height);
       statusEl.textContent='Reset — ready';
@@ -143,56 +152,139 @@
       drawPreview();
     }
     function savePNG(){
-      const url = feedCanvas.toDataURL('image/png');
-      const a=document.createElement('a'); a.href=url; a.download='composite-v2.6.png';
-      document.body.appendChild(a); a.click(); a.remove();
+      const url=feedCanvas.toDataURL('image/png');
+      const a=document.createElement('a'); a.href=url; a.download='composite-v3.0.png'; document.body.appendChild(a); a.click(); a.remove();
     }
 
-    // ---- Worker (inline) ----
+    // Worker (inline)
     function initWorker(width,height){
-      if(worker) { worker.terminate(); worker=null; ready=false; }
+      if(worker){ worker.terminate(); worker=null; ready=false; }
       const code = `
-        let W=0,H=0,N=0, perm=null, frames=[];
-        function mulberry32(a){ return function(){let t=a+=0x6D2B79F5; t=Math.imul(t^t>>>15,t|1); t^=t+Math.imul(t^t>>>7,t|61); return ((t^t>>>14)>>>0)/4294967296; } }
-        function buildPermutation(N, seed){
-          // Fisher–Yates on Uint32 indices (fast enough once)
-          const p = new Uint32Array(N);
-          for(let i=0;i<N;i++) p[i]=i;
-          const rand = mulberry32(seed>>>0);
-          for(let i=N-1;i>0;i--){
-            const j = (rand()*(i+1))|0;
-            const t=p[i]; p[i]=p[j]; p[j]=t;
-          }
-          return p;
+        let W=0,H=0,N=0;
+        let composite=null, comp=null;       // ImageData + Uint8 view
+        let written=null;                    // Uint8: 0/1 written map
+        let bg=null;                         // Float32 background RGB
+        let hot=null;                        // Uint8 consecutive motion counter
+        let lastMask=null;                   // Uint8 mask (0/1) last frame for debug
+        let params={ DIFF:18, CONFIRM:2, DILATE:1, ERODE:0, BG_ALPHA:0.02, ALPHA:1.0 }; // alpha=1 (solid, no brighten)
+        let gateBoxes=[];                    // AI gating boxes [{x,y,w,h}] in canvas coords
+
+        function setSize(w,h){
+          W=w|0; H=h|0; N=W*H;
+          composite = new ImageData(W,H);
+          comp = composite.data;
+          written = new Uint8Array(N);
+          bg = new Float32Array(N*3);
+          hot = new Uint8Array(N);
+          lastMask = new Uint8Array(N);
         }
-        onmessage = async (e)=>{
-          const d=e.data;
-          if(d.type==='init'){
-            W=d.W|0; H=d.H|0; N=W*H;
-            frames.length=0;
-            // seed with size for deterministic shuffle per size
-            perm = buildPermutation(N, (W*73856093)^(H*19349663));
-            postMessage({type:'ready'});
-          } else if(d.type==='add'){
-            // receive frame buffer (transfer ownership)
-            const arr = new Uint8ClampedArray(d.buf);
-            frames.push(arr);
-            if(frames.length>0 && frames.length%2===0){ /* optional noop */ }
-          } else if(d.type==='compose'){
-            if(frames.length===0){ postMessage({type:'composed', empty:true}); return; }
-            const F = frames.length;
-            const out = new Uint8ClampedArray(N*4);
-            // Per-pixel equal assignment: src frame = perm[p] % F
-            for(let p=0,i=0;p<N;p++,i+=4){
-              const src = frames[ perm[p] % F ];
-              out[i  ] = src[i  ];
-              out[i+1] = src[i+1];
-              out[i+2] = src[i+2];
-              out[i+3] = 255;
+        function inBoxes(x,y){
+          if (gateBoxes.length===0) return true; // no AI: pass all
+          for (let b of gateBoxes){
+            if (x>=b.x && y>=b.y && x<b.x+b.w && y<b.y+b.h) return true;
+          }
+          return false;
+        }
+        function dilate3x3(src,W,H,it=1){
+          let a=src, b=new Uint8Array(W*H);
+          for(let t=0;t<it;t++){
+            b.fill(0);
+            for(let y=1;y<H-1;y++){
+              let i=y*W+1;
+              for(let x=1;x<W-1;x++,i++){
+                const i0=i, i1=i-1, i2=i+1, i3=i-W, i4=i+W, i5=i3-1, i6=i3+1, i7=i4-1, i8=i4+1;
+                b[i]=(a[i0]|a[i1]|a[i2]|a[i3]|a[i4]|a[i5]|a[i6]|a[i7]|a[i8])?1:0;
+              }
             }
-            postMessage({type:'composed', buf: out.buffer}, [out.buffer]);
-          } else if(d.type==='reset'){
-            frames.length=0;
+            a=b; b=new Uint8Array(W*H);
+          }
+          return a;
+        }
+        function erode3x3(src,W,H,it=1){
+          let a=src, b=new Uint8Array(W*H);
+          for(let t=0;t<it;t++){
+            b.fill(0);
+            for(let y=1;y<H-1;y++){
+              let i=y*W+1;
+              for(let x=1;x<W-1;x++,i++){
+                const i0=i, i1=i-1, i2=i+1, i3=i-W, i4=i+W, i5=i3-1, i6=i3+1, i7=i4-1, i8=i4+1;
+                b[i]=(a[i0]&a[i1]&a[i2]&a[i3]&a[i4]&a[i5]&a[i6]&a[i7]&a[i8])?1:0;
+              }
+            }
+            a=b; b=new Uint8Array(W*H);
+          }
+          return a;
+        }
+
+        onmessage = (e)=>{
+          const d=e.data;
+          if(d.type==='init'){ setSize(d.W,d.H); postMessage({type:'ready'}); return; }
+          if(d.type==='setParams'){ params = Object.assign(params, d.params||{}); return; }
+          if(d.type==='setBoxes'){ gateBoxes = d.boxes||[]; return; }
+          if(d.type==='reset'){ setSize(W,H); return; }
+          if(d.type==='add'){
+            // frame buffer
+            const fd = new Uint8ClampedArray(d.buf);
+            // If bg is zero, initialize from first frame
+            if (bg[0]===0 && bg[1]===0 && bg[2]===0){
+              for(let p=0,i=0;p<N;p++,i+=4){ bg[i] = fd[i]; bg[i+1] = fd[i+1]; bg[i+2] = fd[i+2]; }
+            }
+
+            // Build motion mask vs background with temporal confirm
+            const bin = new Uint8Array(N);
+            const TH = params.DIFF|0, CF=params.CONFIRM|0, a= params.BG_ALPHA;
+            for(let p=0,i=0,y=0;y<H;y++){
+              for(let x=0;x<W;x++,p++,i+=4){
+                const r=fd[i], g=fd[i+1], b=fd[i+2];
+                const dr = Math.abs(r - bg[i]);
+                const dg = Math.abs(g - bg[i+1]);
+                const db = Math.abs(b - bg[i+2]);
+                const dL = (0.299*dr + 0.587*dg + 0.114*db);
+                // update background slowly where we haven't yet written
+                if (written[p]===0){
+                  bg[i]   = bg[i]  * (1-a) + r * a;
+                  bg[i+1] = bg[i+1]*(1-a) + g * a;
+                  bg[i+2] = bg[i+2]*(1-a) + b * a;
+                }
+                // AI gate
+                let gateOK = true;
+                if (gateBoxes.length>0){
+                  const gx = x, gy = y;
+                  gateOK = false;
+                  for (let B of gateBoxes){
+                    if (gx>=B.x && gy>=B.y && gx<B.x+B.w && gy<B.y+B.h){ gateOK=true; break; }
+                  }
+                }
+                if (gateOK && dL>TH){
+                  if (hot[p]<255) hot[p]++; 
+                } else {
+                  hot[p]=0;
+                }
+                bin[p] = (hot[p]>=CF)?1:0;
+              }
+            }
+            // Morphology
+            let mask = bin;
+            if((params.DILATE|0)>0) mask = dilate3x3(mask,W,H,params.DILATE|0);
+            if((params.ERODE|0)>0)  mask = erode3x3(mask,W,H,params.ERODE|0);
+            lastMask = mask;
+
+            // Write-once commit
+            const oa = params.ALPHA; const ia = 1-oa;
+            for(let p=0,i=0;p<N;p++,i+=4){
+              if(mask[p]===1 && written[p]===0){
+                // solid stamp (or blend if you want faint trails: use oa<1)
+                comp[i]   = (comp[i]  * ia + fd[i]   * oa) | 0;
+                comp[i+1] = (comp[i+1]* ia + fd[i+1] * oa) | 0;
+                comp[i+2] = (comp[i+2]* ia + fd[i+2] * oa) | 0;
+                comp[i+3] = 255;
+                written[p]=1;
+              }
+            }
+            postMessage({type:'composed', buf: composite.data.buffer}, [composite.data.buffer]);
+            // restore view after transfer
+            composite = new ImageData(new Uint8ClampedArray(comp), W, H);
+            comp = composite.data;
           }
         };
       `;
@@ -201,19 +293,58 @@
         const d=e.data;
         if(d.type==='ready'){ ready=true; statusEl.textContent='Ready — press Start'; }
         else if(d.type==='composed'){
-          if(d.empty) return;
           const arr = new Uint8ClampedArray(d.buf);
           const img = new ImageData(arr, W, H);
           cctx.putImageData(img, 0, 0);
         }
       };
       worker.postMessage({type:'init', W:width, H:height});
+      // default worker params (tuned)
+      worker.postMessage({type:'setParams', params:{ DIFF:18, CONFIRM:2, DILATE:1, ERODE:0, BG_ALPHA:0.02, ALPHA:1.0 }});
     }
 
-    // ---- Camera init (prefer rear) ----
+    // AI loader & polling
+    async function ensureModel(){
+      if(model || aiOn===false) return;
+      try{
+        if(document.getElementById('tfjs')?.dataset.fail || document.getElementById('cocossd')?.dataset.fail) throw new Error('cdn blocked');
+        // wait for scripts to finish
+        if(!('cocoSsd' in window)){ await new Promise(r=>setTimeout(r,200)); }
+        model = await cocoSsd.load({base:'lite_mobilenet_v2'}); // lightest
+        statusEl.textContent='AI ready';
+      }catch(e){
+        model=null; statusEl.textContent='AI failed — using motion only';
+        aiOn=false; focusSel.value='motion';
+      }
+    }
+    function startAIPoll(){
+      if(aiTick){ clearInterval(aiTick); aiTick=null; }
+      if(!aiOn) return;
+      aiTick = setInterval(async ()=>{
+        if(!model || !W || !H) return;
+        // run detection on small tensor (reuse frame canvas)
+        const preds = await model.detect(frameCanvas, 5);
+        const boxes=[];
+        const want = (aiKind==='person') ? ['person'] : ['sports ball','sports_ball','sportsball','ball'];
+        for(const p of preds){
+          if(want.includes(p.class) && p.score>0.35){
+            // p.bbox = [x,y,width,height] in canvas pixels
+            let [x,y,w,h] = p.bbox;
+            // pad a bit
+            const pad = 12;
+            x=Math.max(0,x-pad); y=Math.max(0,y-pad);
+            w=Math.min(W-x,w+pad*2); h=Math.min(H-y,h+pad*2);
+            boxes.push({x:Math.round(x), y:Math.round(y), w:Math.round(w), h:Math.round(h)});
+          }
+        }
+        worker?.postMessage({type:'setBoxes', boxes});
+      }, 300); // ~3 fps AI gating is enough
+    }
+
+    // Camera init (prefer rear)
     (async function initCamera(){
       statusEl.textContent='Requesting camera…';
-      const tries = [
+      const tries=[
         {video:{facingMode:{exact:'environment'}},audio:false},
         {video:{facingMode:{ideal:'environment'}},audio:false},
         {video:{facingMode:{ideal:'user'}},audio:false},
@@ -223,44 +354,54 @@
       for(const c of tries){ try{ stream=await navigator.mediaDevices.getUserMedia(c); ok=true; break; } catch{} }
       if(!ok){ statusEl.textContent='Camera blocked/unavailable'; return; }
       videoEl.srcObject=stream; try{ await videoEl.play(); }catch{}
-      statusEl.textContent='Camera ready — press Start';
+      statusEl.textContent='Camera ready — choose Focus and press Start';
       drawPreview();
     })();
 
-    // ---- Start/Stop capture ----
-    startBtn.addEventListener('click', ()=>{
+    // Start/Stop
+    startBtn.addEventListener('click', async ()=>{
       if(!stream) return;
       if(!capturing){
-        // START
         if(!initCanvasSizes()) return;
-        if(!ready){ statusEl.textContent='Preparing pattern…'; return; }
+        if(!ready){ statusEl.textContent='Preparing…'; return; }
+
+        // AI mode?
+        aiKind = focusSel.value;
+        aiOn = (aiKind!=='motion');
+        if(aiOn){ await ensureModel(); startAIPoll(); }
+        else { if(aiTick){ clearInterval(aiTick); aiTick=null; worker?.postMessage({type:'setBoxes', boxes:[]}); } }
+
         capturing=true; startBtn.textContent='Stop'; startBtn.style.background='#b00000';
         try{ cancelAnimationFrame(previewRAF); }catch{} previewRAF=null;
+
         const intervalMs = Math.max(10, parseInt(intSel.value||'200',10));
         timer = setInterval(()=>{
-          const buf = grabFrameToBuffer();
-          worker.postMessage({type:'add', buf}, [buf]);   // transfer frame to worker
-          worker.postMessage({type:'compose'});           // ask worker to build composite
-          statusEl.textContent='Mixing frames equally (pixel-checker)…';
+          const buf = grabFrameBuffer();
+          worker.postMessage({type:'add', buf}, [buf]); // transfer buffer
+          statusEl.textContent = aiOn ? `Stamping motion in AI box (${aiKind})…` : 'Stamping motion only…';
         }, intervalMs);
       } else {
-        // STOP
         capturing=false; startBtn.textContent='Start'; startBtn.style.background='#e10000';
         if(timer){ clearInterval(timer); timer=null; }
+        if(aiTick){ clearInterval(aiTick); aiTick=null; }
         statusEl.textContent='Stopped — composite preserved';
       }
     });
 
+    // UI hooks
     resetBtn.addEventListener('click', resetAll);
     saveBtn.addEventListener('click', savePNG);
+    focusSel.addEventListener('change', async ()=>{
+      if(focusSel.value==='motion'){ aiOn=false; if(aiTick){ clearInterval(aiTick); aiTick=null; } worker?.postMessage({type:'setBoxes', boxes:[]}); statusEl.textContent='Focus: Motion only'; }
+      else { aiKind=focusSel.value; aiOn=true; await ensureModel(); startAIPoll(); statusEl.textContent='Focus: AI '+aiKind; }
+    });
 
     // Cleanup
     window.addEventListener('beforeunload', ()=>{
       try{ if(previewRAF) cancelAnimationFrame(previewRAF); }catch{}
       try{ if(timer) clearInterval(timer); }catch{}
-      try{
-        if(stream){ const tracks=stream.getTracks?stream.getTracks():[]; tracks.forEach(t=>{ try{t.stop();}catch{} }); }
-      }catch{}
+      try{ if(aiTick) clearInterval(aiTick); }catch{}
+      try{ if(stream){ const tracks=stream.getTracks?stream.getTracks():[]; tracks.forEach(t=>{ try{t.stop();}catch{} }); } }catch{}
       if(worker) worker.terminate();
     });
   </script>
