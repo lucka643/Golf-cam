@@ -3,7 +3,6 @@
   <head>
     <meta charset="UTF-8" />
     <title>Interval Camera</title>
-    <!-- Load React + ReactDOM from CDN -->
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
@@ -14,16 +13,15 @@
   <body>
     <div id="root"></div>
 
-    <!-- Full React App -->
     <script type="text/babel">
-      const { useRef, useState } = React;
+      const { useEffect, useRef, useState } = React;
 
       function IntervalCamera() {
+        const videoRef = useRef(null);
         const compositeRef = useRef(null);
-        const baseInputRef = useRef(null);
-        const burstInputRef = useRef(null);
-
-        const [status, setStatus] = useState("Tap Base to begin");
+        const scratchRef = useRef(null);
+        const [status, setStatus] = useState("Requesting camera…");
+        const [hasBase, setHasBase] = useState(false);
         const [baseClicked, setBaseClicked] = useState(false);
         const [startClicked, setStartClicked] = useState(false);
         const [pressBase, setPressBase] = useState(false);
@@ -31,97 +29,88 @@
         const [overlayCount, setOverlayCount] = useState(0);
         const [showResult, setShowResult] = useState(false);
 
+        useEffect(() => {
+          async function enableCam() {
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+              videoRef.current.srcObject = stream;
+              await videoRef.current.play();
+              setStatus("Camera ready");
+            } catch {
+              setStatus("Camera blocked");
+            }
+          }
+          enableCam();
+        }, []);
+
         function pressAnim(setter) {
           setter(true);
           setTimeout(() => setter(false), 140);
         }
 
-        function loadImageFromFile(file) {
-          return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => {
-              const img = new Image();
-              img.onload = () => resolve(img);
-              img.onerror = reject;
-              img.src = reader.result;
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(file);
-          });
+        function grabFrame() {
+          const v = videoRef.current;
+          const s = scratchRef.current;
+          s.width = v.videoWidth;
+          s.height = v.videoHeight;
+          const ctx = s.getContext("2d");
+          ctx.drawImage(v, 0, 0);
+          return s;
         }
 
-        async function onPickBase(e) {
-          const file = e.target.files[0];
-          if (!file) return;
-          const img = await loadImageFromFile(file);
+        function captureBase() {
+          pressAnim(setPressBase);
+          const s = grabFrame();
           const c = compositeRef.current;
-          c.width = img.width;
-          c.height = img.height;
+          c.width = s.width;
+          c.height = s.height;
           const ctx = c.getContext("2d");
           ctx.globalAlpha = 1.0;
-          ctx.drawImage(img, 0, 0);
+          ctx.drawImage(s, 0, 0);
+          setHasBase(true);
           setBaseClicked(true);
-          setStatus("Base captured — now add photos");
+          setStatus("Base captured");
         }
 
-        async function onPickBurst(e) {
-          if (!baseClicked) return;
-          const files = Array.from(e.target.files);
-          const c = compositeRef.current;
-          const ctx = c.getContext("2d");
-          let count = 0;
-          for (const file of files) {
-            const img = await loadImageFromFile(file);
-            ctx.globalAlpha = 0.25;
-            ctx.drawImage(img, 0, 0, c.width, c.height);
-            count++;
-            setOverlayCount(count);
-          }
+        function startCapturing() {
+          pressAnim(setPressStart);
+          if (!hasBase) return;
           setStartClicked(true);
-          setStatus("Done");
-          setShowResult(true);
+          let taken = 0;
+          const interval = setInterval(() => {
+            const s = grabFrame();
+            const c = compositeRef.current;
+            const ctx = c.getContext("2d");
+            ctx.globalAlpha = 0.25;
+            ctx.drawImage(s, 0, 0, c.width, c.height);
+            taken++;
+            setOverlayCount(taken);
+            if (taken >= 20) {
+              clearInterval(interval);
+              setShowResult(true);
+              setStatus("Done");
+            }
+          }, 200);
         }
 
         return (
-          <div className="w-full h-screen bg-black text-white relative flex items-center justify-center">
-            {showResult ? (
-              <canvas ref={compositeRef} className="absolute inset-0 w-full h-full object-contain" />
-            ) : (
-              <canvas ref={compositeRef} className="absolute top-3 right-3 w-[240px] h-[160px] border border-white/70 shadow-lg" />
-            )}
+          <div className="w-full h-screen bg-black text-white relative overflow-hidden">
+            <video ref={videoRef} className={`absolute inset-0 w-full h-full object-contain ${showResult ? 'opacity-0' : 'opacity-100'}`} muted playsInline />
+            <canvas ref={compositeRef} className={`${showResult ? 'absolute inset-0 w-full h-full' : 'absolute top-3 right-3 w-[240px] h-[160px] border border-white/70 shadow-lg'}`} />
+            <canvas ref={scratchRef} className="hidden" />
 
-            <div className="absolute top-4 left-4 px-3 py-2 bg-white/10 rounded text-sm">
-              {status} {overlayCount > 0 && `— ${overlayCount}`}
-            </div>
+            <div className="absolute top-4 left-4 px-3 py-2 bg-white/10 rounded text-sm">{status} {overlayCount>0 && `— ${overlayCount}`}</div>
 
             <div className="absolute bottom-8 left-0 right-0 flex justify-center gap-12">
-              <button
-                onClick={() => baseInputRef.current.click()}
-                disabled={baseClicked}
-                className={`flex flex-col items-center gap-2 transition-opacity ${baseClicked ? "opacity-40" : "opacity-100"}`}
-              >
-                <div
-                  className={`w-20 h-20 rounded-full border-2 border-black bg-white transform transition-transform ${pressBase ? "scale-95" : "scale-100"}`}
-                  onMouseDown={() => pressAnim(setPressBase)}
-                />
+              <button onClick={captureBase} disabled={baseClicked} className={`flex flex-col items-center gap-2 transition-opacity ${baseClicked ? 'opacity-40':'opacity-100'}`}>
+                <div className={`w-20 h-20 rounded-full border-2 border-black bg-white transform transition-transform ${pressBase ? 'scale-95':'scale-100'}`} />
                 <span>Base</span>
               </button>
-
-              <button
-                onClick={() => burstInputRef.current.click()}
-                disabled={!baseClicked || startClicked}
-                className={`flex flex-col items-center gap-2 transition-opacity ${!baseClicked || startClicked ? "opacity-40" : "opacity-100"}`}
-              >
-                <div
-                  className={`w-28 h-28 rounded-full border-4 border-white bg-red-600 transform transition-transform ${pressStart ? "scale-95" : "scale-100"}`}
-                  onMouseDown={() => pressAnim(setPressStart)}
-                />
+              <button onClick={startCapturing} disabled={!hasBase||startClicked} className={`flex flex-col items-center gap-2 transition-opacity ${!hasBase||startClicked ? 'opacity-40':'opacity-100'}`}>
+                <div className={`w-28 h-28 rounded-full border-4 border-white bg-red-600 transform transition-transform ${pressStart ? 'scale-95':'scale-100'}`} />
                 <span>Start</span>
               </button>
             </div>
-
-            <input ref={baseInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={onPickBase} />
-            <input ref={burstInputRef} type="file" accept="image/*" multiple className="hidden" onChange={onPickBurst} />
           </div>
         );
       }
