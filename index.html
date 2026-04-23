@@ -1,1 +1,304 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Golf Cam Pose App Scaffold</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
 
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+
+      .app {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        min-height: 100vh;
+      }
+
+      .panel {
+        padding: 1rem;
+      }
+
+      .left-panel {
+        background: linear-gradient(160deg, #111827, #1f2937);
+        display: grid;
+        place-items: center;
+      }
+
+      .image-card {
+        width: min(92%, 720px);
+        background: #111827;
+        border: 1px solid #334155;
+        border-radius: 16px;
+        padding: 0.75rem;
+        box-shadow: 0 16px 32px rgb(0 0 0 / 0.35);
+      }
+
+      .image-card img {
+        width: 100%;
+        height: auto;
+        border-radius: 12px;
+        display: block;
+      }
+
+      .image-card h2,
+      .image-card p {
+        margin: 0.75rem 0 0;
+      }
+
+      .right-panel {
+        position: relative;
+        background: #020617;
+        overflow: hidden;
+      }
+
+      .video-wrap {
+        position: absolute;
+        inset: 0;
+      }
+
+      video,
+      canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .hud {
+        position: absolute;
+        left: 1rem;
+        top: 1rem;
+        padding: 0.6rem 0.8rem;
+        border: 1px solid #334155;
+        background: rgb(2 6 23 / 0.65);
+        border-radius: 10px;
+        z-index: 2;
+        backdrop-filter: blur(6px);
+      }
+
+      .hud strong {
+        color: #22d3ee;
+      }
+
+      .error {
+        color: #fca5a5;
+        font-size: 0.95rem;
+      }
+
+      @media (max-width: 900px) {
+        .app {
+          grid-template-columns: 1fr;
+        }
+
+        .left-panel,
+        .right-panel {
+          min-height: 50vh;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel left-panel">
+        <div class="image-card">
+          <img id="poseImage" alt="Image that will change based on recognized gesture" />
+          <h2 id="poseTitle">Waiting for pose input</h2>
+          <p id="poseDescription">
+            This area is wired to gesture-based image switching. Gesture rules are intentionally left open for now.
+          </p>
+          <p class="error" id="errorText"></p>
+        </div>
+      </section>
+
+      <section class="panel right-panel">
+        <div class="hud">Current label: <strong id="currentLabel">none</strong></div>
+        <div class="video-wrap">
+          <video id="camera" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+        </div>
+      </section>
+    </main>
+
+    <script type="module">
+      import {
+        FilesetResolver,
+        PoseLandmarker,
+        DrawingUtils,
+      } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+      const video = document.getElementById("camera");
+      const canvas = document.getElementById("overlay");
+      const ctx = canvas.getContext("2d");
+      const labelEl = document.getElementById("currentLabel");
+      const imageEl = document.getElementById("poseImage");
+      const titleEl = document.getElementById("poseTitle");
+      const descriptionEl = document.getElementById("poseDescription");
+      const errorEl = document.getElementById("errorText");
+
+      let poseLandmarker;
+      let drawingUtils;
+      let lastVideoTime = -1;
+
+      const imagesByLabel = {
+        idle: {
+          title: "No gesture mapped yet",
+          description:
+            "Pose overlay is running. Add your gesture rules + image paths in classifyGesture() and imagesByLabel.",
+          src: makePlaceholder("Idle / default", "#0ea5e9", "#1e293b"),
+        },
+        person_detected: {
+          title: "Person detected",
+          description:
+            "Pose landmarks are visible. Replace this with your real gesture-specific image.",
+          src: makePlaceholder("Person detected", "#22c55e", "#14532d"),
+        },
+      };
+
+      setDisplayedImage("idle");
+
+      async function start() {
+        try {
+          await setupCamera();
+          await setupPoseLandmarker();
+          requestAnimationFrame(processFrame);
+        } catch (error) {
+          errorEl.textContent = `Startup error: ${error.message}`;
+          console.error(error);
+        }
+      }
+
+      async function setupCamera() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+        });
+
+        video.srcObject = stream;
+
+        await new Promise((resolve) => {
+          video.onloadedmetadata = () => resolve();
+        });
+
+        resizeOverlay();
+        window.addEventListener("resize", resizeOverlay);
+      }
+
+      async function setupPoseLandmarker() {
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+
+        poseLandmarker = await PoseLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+          },
+          runningMode: "VIDEO",
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.5,
+          minPosePresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+        });
+
+        drawingUtils = new DrawingUtils(ctx);
+      }
+
+      function resizeOverlay() {
+        canvas.width = video.videoWidth || video.clientWidth;
+        canvas.height = video.videoHeight || video.clientHeight;
+      }
+
+      function processFrame() {
+        if (!poseLandmarker) {
+          requestAnimationFrame(processFrame);
+          return;
+        }
+
+        if (video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          const result = poseLandmarker.detectForVideo(video, performance.now());
+          drawPose(result);
+
+          const label = classifyGesture(result);
+          labelEl.textContent = label;
+          setDisplayedImage(label);
+        }
+
+        requestAnimationFrame(processFrame);
+      }
+
+      function drawPose(result) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (!result.landmarks?.length) return;
+
+        for (const landmarks of result.landmarks) {
+          drawingUtils.drawLandmarks(landmarks, {
+            color: "#22d3ee",
+            lineWidth: 2,
+            radius: 3,
+          });
+          drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
+            color: "#f97316",
+            lineWidth: 3,
+          });
+        }
+      }
+
+      function classifyGesture(result) {
+        // TODO: Define your custom gesture labels from landmarks here.
+        // Example return values: "backswing", "impact", "follow_through".
+        // Keep imagesByLabel in sync with those labels.
+        if (result.landmarks?.length) return "person_detected";
+        return "idle";
+      }
+
+      function setDisplayedImage(label) {
+        const selected = imagesByLabel[label] || imagesByLabel.idle;
+        imageEl.src = selected.src;
+        titleEl.textContent = selected.title;
+        descriptionEl.textContent = selected.description;
+      }
+
+      function makePlaceholder(text, accent, bg) {
+        const svg = `
+          <svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800'>
+            <defs>
+              <linearGradient id='g' x1='0' x2='1' y1='0' y2='1'>
+                <stop offset='0%' stop-color='${bg}' />
+                <stop offset='100%' stop-color='#020617' />
+              </linearGradient>
+            </defs>
+            <rect width='100%' height='100%' fill='url(#g)' />
+            <circle cx='180' cy='180' r='120' fill='${accent}' opacity='0.35' />
+            <circle cx='1020' cy='620' r='140' fill='${accent}' opacity='0.2' />
+            <text x='50%' y='48%' text-anchor='middle' fill='#e2e8f0' font-size='72' font-family='Arial, sans-serif'>${text}</text>
+            <text x='50%' y='57%' text-anchor='middle' fill='#94a3b8' font-size='32' font-family='Arial, sans-serif'>Replace with your own image assets</text>
+          </svg>
+        `;
+
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      }
+
+      start();
+    </script>
+  </body>
+</html>
